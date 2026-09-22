@@ -15,7 +15,7 @@ fn make_sine(sr: i32, ch: usize, frame_size: usize, freq: f32) -> Vec<f32> {
 
 fn hex_to_bytes(s: &str) -> Vec<u8> {
     let s = s.trim();
-    assert!(s.len() % 2 == 0, "odd hex length");
+    assert!(s.len().is_multiple_of(2), "odd hex length");
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
@@ -207,7 +207,7 @@ fn oracle_all_sr_ch_br() {
             for &br in &brs {
                 let fs = sr / 50;
                 let pcm = make_sine(sr, ch, fs as usize, freq);
-                let mut rs_enc = RsEnc::new(sr, ch as usize, RsApp::Audio).unwrap();
+                let mut rs_enc = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
                 rs_enc.bitrate_bps = br;
                 rs_enc.use_cbr = true;
                 rs_enc.complexity = 10;
@@ -266,10 +266,10 @@ fn oracle_all_sr_ch_br() {
                         c_n
                     );
                 }
-                let mut dec = RsDec::new(sr, ch as usize).unwrap();
-                let mut out = vec![0.0f32; fs as usize * ch as usize];
+                let mut dec = RsDec::new(sr, ch).unwrap();
+                let mut out = vec![0.0f32; fs as usize * ch];
                 let got = dec.decode(&rs_buf[..rs_n], fs as usize, &mut out).unwrap();
-                let max = out[..got * ch as usize]
+                let max = out[..got * ch]
                     .iter()
                     .fold(0.0f32, |a, &x| a.max(x.abs()));
                 assert!(

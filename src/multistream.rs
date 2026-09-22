@@ -124,7 +124,7 @@ pub fn split_self_delimited<'a>(
             } else {
                 let (n, len_bytes) = parse_frame_size(&data[cursor..])?;
                 cursor += len_bytes; // excised: normal CBR code 3 has no length field at all
-                sizes.extend(std::iter::repeat(n).take(m));
+                sizes.extend(std::iter::repeat_n(n, m));
             }
 
             for n in sizes {
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn split_code0_two_byte_length() {
         let mut bytes = vec![toc_byte(0, false, 0), 252, 0];
-        bytes.extend(std::iter::repeat(0x7Fu8).take(252));
+        bytes.extend(std::iter::repeat_n(0x7Fu8, 252));
         let mut scratch = Vec::new();
         let (_, consumed) = split_self_delimited(&bytes, &mut scratch).unwrap();
         assert_eq!(consumed, 1 + 2 + 252);

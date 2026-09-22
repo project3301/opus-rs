@@ -1,3 +1,7 @@
+// Verification scripts intentionally mirror the C reference style
+// (index-based loops, grouped hex tables) — keep clippy quiet.
+#![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
+
 //! Deterministic TOC-sequence fuzz harness for `OpusDecoder::decode`.
 //!
 //! Previous fuzz coverage only threw single packets at fresh decoders or
@@ -11,6 +15,7 @@
 //!   * random TOC byte + random-length garbage payload,
 //!   * 1-byte payloads (PLC trigger),
 //!   * truncated packets.
+//!
 //! Decode errors are fine; panics are not.
 
 use opus_rs::OpusDecoder;

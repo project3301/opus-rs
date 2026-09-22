@@ -1,3 +1,7 @@
+// Verification scripts intentionally mirror the C reference style
+// (index-based loops, grouped hex tables) — keep clippy quiet.
+#![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
+
 #[cfg(test)]
 mod tests {
     use opus_rs::silk::define::MAX_PREDICTION_POWER_GAIN;

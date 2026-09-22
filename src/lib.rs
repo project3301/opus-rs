@@ -13,6 +13,10 @@ pub mod hp_cutoff;
 pub mod kiss_fft;
 pub mod mdct;
 pub mod modes;
+/// Multistream decode uses `Vec`-based plumbing, so it is only available
+/// with the `std` (default) feature set; the core codec stays `no_std`
+/// + no-`alloc` capable (see `split_self_delimited` docs).
+#[cfg(feature = "std")]
 pub mod multistream;
 pub mod pitch;
 pub mod pvq;
@@ -25,7 +29,7 @@ pub use silk::{SilkResampler, SilkResamplerDown1_3, SilkResamplerDown1_6};
 
 use crate::fixedvec::FixedVec;
 pub use celt::{CeltDecoder, CeltEncoder};
-use hp_cutoff::{dc_reject_float, hp_cutoff, hp_cutoff_float};
+use hp_cutoff::{dc_reject_float, hp_cutoff, hp_cutoff_float, hp_cutoff_i16};
 use range_coder::RangeCoder;
 use silk::control_codec::silk_control_encoder;
 use silk::enc_api::silk_encode;
@@ -148,6 +152,12 @@ pub struct OpusEncoder {
     buf_celt_pcm: FixedVec<f32, OPUS_PCM_BUF>,
     #[cfg(feature = "heap")]
     buf_celt_pcm: Box<FixedVec<f32, OPUS_PCM_BUF>>,
+    /// f32 staging of the current frame for the CELT/Hybrid float pipeline
+    /// when the caller feeds `encode_i16()` (issue #28).
+    #[cfg(not(feature = "heap"))]
+    buf_f32_frame: FixedVec<f32, OPUS_MAX_FRAME>,
+    #[cfg(feature = "heap")]
+    buf_f32_frame: Box<FixedVec<f32, OPUS_MAX_FRAME>>,
     /// C `encoder_buffer` (= Fs/100): samples of ring history kept between
     /// frames (0 for restricted-latency applications).
     encoder_buffer: usize,
@@ -163,6 +173,24 @@ pub struct OpusEncoder {
     down_1_3_state: silk::resampler::SilkResamplerDown1_3,
 
     rc: RangeCoder,
+}
+
+/// Format-agnostic PCM input for `encode_impl` (issue #28): `F32` is the
+/// classic float path; `I16` reaches the SILK integer pipeline directly
+/// and is converted to f32 only where the CELT pipeline requires it.
+#[derive(Clone, Copy)]
+enum PcmInput<'a> {
+    F32(&'a [f32]),
+    I16(&'a [i16]),
+}
+
+impl PcmInput<'_> {
+    fn len(&self) -> usize {
+        match self {
+            PcmInput::F32(s) => s.len(),
+            PcmInput::I16(s) => s.len(),
+        }
+    }
 }
 
 fn compute_equiv_rate(
@@ -435,6 +463,10 @@ impl OpusEncoder {
             buf_celt_pcm: FixedVec::new(),
             #[cfg(feature = "heap")]
             buf_celt_pcm: Box::new(FixedVec::new()),
+            #[cfg(not(feature = "heap"))]
+            buf_f32_frame: FixedVec::new(),
+            #[cfg(feature = "heap")]
+            buf_f32_frame: Box::new(FixedVec::new()),
             encoder_buffer: if matches!(application, Application::RestrictedLowDelay) {
                 0
             } else {
@@ -469,9 +501,36 @@ impl OpusEncoder {
         Ok(())
     }
 
+    /// Encode a frame of interleaved f32 PCM (scale ±1.0; C `opus_encode_float`
+    /// convention where 1.0 maps to PCM16 32768). Samples are consumed exactly
+    /// up to `frame_size * channels`.
     pub fn encode(
         &mut self,
         input: &[f32],
+        frame_size: usize,
+        output: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        self.encode_impl(PcmInput::F32(input), frame_size, output)
+    }
+
+    /// Encode a frame of interleaved PCM16 (`opus_int16` C `opus_encode()`
+    /// convention). Produces byte-for-byte identical packets to
+    /// `encode()` called with the same audio converted via
+    /// `sample as f32 / 32768.0`, while skipping the f32 round-trip in the
+    /// SILK/VoIP path: the integer high-pass biquad and SILK pipeline are fed
+    /// natively, with no temporary conversion buffer (issue #28).
+    pub fn encode_i16(
+        &mut self,
+        input: &[i16],
+        frame_size: usize,
+        output: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        self.encode_impl(PcmInput::I16(input), frame_size, output)
+    }
+
+    fn encode_impl(
+        &mut self,
+        input: PcmInput<'_>,
         frame_size: usize,
         output: &mut [u8],
     ) -> Result<usize, &'static str> {
@@ -583,10 +642,9 @@ impl OpusEncoder {
         let mut n_bytes = if self.use_cbr {
             cbr_bytes
                 .min(max_data_bytes)
-                .max(1)
-                .min(OPUS_MAX_PACKET_BYTES)
+                .clamp(1, OPUS_MAX_PACKET_BYTES)
         } else {
-            max_data_bytes.max(1).min(OPUS_MAX_PACKET_BYTES)
+            max_data_bytes.clamp(1, OPUS_MAX_PACKET_BYTES)
         };
         let init_rc_size = n_bytes - 1;
         self.rc.reset_for_encode(init_rc_size as u32);
@@ -649,20 +707,44 @@ impl OpusEncoder {
 
             let required_size = frame_size * self.channels;
             self.buf_filtered.resize(required_size, 0);
-            if self.application == Application::Voip {
-                hp_cutoff(
-                    input,
-                    cutoff_hz,
-                    state_mut(&mut self.buf_filtered),
-                    &mut self.hp_mem,
-                    frame_size,
-                    self.channels,
-                    self.sampling_rate,
-                );
-            } else {
-                let required_size = frame_size * self.channels;
-                for (i, &x) in input.iter().enumerate().take(required_size) {
-                    self.buf_filtered[i] = (x * 32768.0).clamp(-32768.0, 32767.0) as i16;
+            let voip = self.application == Application::Voip;
+            match input {
+                PcmInput::I16(samples) => {
+                    if voip {
+                        // Native i16 path: feed the integer HP biquad directly,
+                        // skipping the f32 round-trip and its temporary
+                        // conversion buffer (issue #28).
+                        hp_cutoff_i16(
+                            samples,
+                            cutoff_hz,
+                            state_mut(&mut self.buf_filtered),
+                            &mut self.hp_mem,
+                            frame_size,
+                            self.channels,
+                            self.sampling_rate,
+                        );
+                    } else {
+                        let filtered = state_mut(&mut self.buf_filtered);
+                        filtered[..required_size].copy_from_slice(&samples[..required_size]);
+                    }
+                }
+                PcmInput::F32(samples) => {
+                    if voip {
+                        hp_cutoff(
+                            samples,
+                            cutoff_hz,
+                            state_mut(&mut self.buf_filtered),
+                            &mut self.hp_mem,
+                            frame_size,
+                            self.channels,
+                            self.sampling_rate,
+                        );
+                    } else {
+                        let filtered = state_mut(&mut self.buf_filtered);
+                        for (i, &x) in samples.iter().enumerate().take(required_size) {
+                            filtered[i] = (x * 32768.0).clamp(-32768.0, 32767.0) as i16;
+                        }
+                    }
                 }
             }
 
@@ -833,10 +915,7 @@ impl OpusEncoder {
                     + tell as i64 * self.sampling_rate as i64;
                 let adjusted = ((tmp + 4 * self.sampling_rate as i64)
                     / (8 * self.sampling_rate as i64)) as usize;
-                let new_n = adjusted
-                    .min(max_data_bytes)
-                    .max(1)
-                    .min(OPUS_MAX_PACKET_BYTES);
+                let new_n = adjusted.clamp(1, OPUS_MAX_PACKET_BYTES).min(max_data_bytes);
                 if new_n < n_bytes {
                     n_bytes = new_n;
                     // shrink range coder to new size (keep SILK bytes, trim tail)
@@ -864,6 +943,24 @@ impl OpusEncoder {
             self.celt_enc
                 .set_constrained_vbr(mode == OpusMode::CeltOnly);
 
+            // Float view of the current frame for the CELT pipeline. For the
+            // i16 entry point this converts once into a scratch buffer with
+            // the exact per-sample scaling a caller of `encode()` performs
+            // (`s as f32 / 32768.0`), so packets stay byte-for-byte identical
+            // across the two entry points (issue #28).
+            let input_f32: &[f32] = match input {
+                PcmInput::F32(samples) => samples,
+                PcmInput::I16(samples) => {
+                    let n = frame_size * self.channels;
+                    self.buf_f32_frame.resize(n, 0.0);
+                    let staging = state_mut(&mut self.buf_f32_frame);
+                    for (dst, &src) in staging[..n].iter_mut().zip(samples[..n].iter()) {
+                        *dst = src as f32 / 32768.0;
+                    }
+                    state_ref(&self.buf_f32_frame)
+                }
+            };
+
             // Build the CELT input exactly like C `opus_encode_frame_native`:
             //   pcm_buf = [delay-compensation prefix from ring]
             //             [dc_reject / hp_cutoff'd current frame]
@@ -885,7 +982,7 @@ impl OpusEncoder {
                 let out = &mut self.buf_celt_pcm[prefix..];
                 if self.application == Application::Voip {
                     hp_cutoff_float(
-                        input,
+                        input_f32,
                         cutoff_hz,
                         out,
                         &mut self.hp_mem_float,
@@ -895,7 +992,7 @@ impl OpusEncoder {
                     );
                 } else {
                     dc_reject_float(
-                        input,
+                        input_f32,
                         3,
                         out,
                         &mut self.hp_mem_float,
@@ -909,6 +1006,9 @@ impl OpusEncoder {
                 for &v in &self.buf_celt_pcm[prefix..] {
                     sum += v * v;
                 }
+                // C shape kept verbatim (`!(sum < 1e9f) || celt_isnan(sum)`):
+                // the negated comparison is deliberate NaN handling.
+                #[allow(clippy::neg_cmp_op_on_partial_ord)]
                 if !(sum < 1e9) || sum.is_nan() {
                     self.buf_celt_pcm[prefix..].fill(0.0);
                     self.hp_mem_float = [0.0; 4];
@@ -938,13 +1038,14 @@ impl OpusEncoder {
                 }
                 state_ref(&self.buf_celt_input)
             } else if self.channels == 1 {
-                input
+                input_f32
             } else {
                 let n = frame_size * self.channels;
                 self.buf_celt_input.resize(n, 0.0);
                 for i in 0..frame_size {
                     for ch in 0..self.channels {
-                        self.buf_celt_input[ch * frame_size + i] = input[i * self.channels + ch];
+                        self.buf_celt_input[ch * frame_size + i] =
+                            input_f32[i * self.channels + ch];
                     }
                 }
                 state_ref(&self.buf_celt_input)
@@ -1198,7 +1299,7 @@ impl OpusDecoder {
                 let data_len = input.len() - 1;
                 // RFC 6716 §3.2.1: code 1 carries two equal-size (CBR) frames,
                 // so the payload length must be even. libopus rejects odd lengths.
-                if data_len % 2 != 0 {
+                if !data_len.is_multiple_of(2) {
                     return Err("Code 1: payload length must be even");
                 }
                 let half = data_len / 2;
@@ -1228,7 +1329,7 @@ impl OpusDecoder {
                 }
                 let count_byte = input[1];
                 let n_frames = (count_byte & 0x3F) as usize;
-                if n_frames < 1 || n_frames > 48 {
+                if !(1..=48).contains(&n_frames) {
                     return Err("Code 3: invalid frame count");
                 }
                 frame_count = n_frames;
@@ -1295,7 +1396,7 @@ impl OpusDecoder {
                     // CBR (V=0): remaining bytes are split equally into M frames
                     // (RFC 6716 §3.2.1: "the remaining bytes are split into M
                     // equal chunks").
-                    if payload.len() % frame_count != 0 {
+                    if !payload.len().is_multiple_of(frame_count) {
                         return Err("Code 3 CBR: payload not divisible by frame count");
                     }
                     let frame_len = payload.len() / frame_count;
@@ -1340,10 +1441,10 @@ impl OpusDecoder {
         // This is the primary fix for issue #8/#9 alignment divergence:
         // stale CELT MDCT/prefilter state at SILK↔CELT boundaries causes
         // discontinuities that accumulate across transitions.
-        let mode_transition = match self.prev_mode {
-            Some(prev) if prev != mode && !self.prev_redundancy => true,
-            _ => false,
-        };
+        let mode_transition = matches!(
+            self.prev_mode,
+            Some(prev) if prev != mode && !self.prev_redundancy
+        );
         if mode_transition {
             self.celt_dec.reset_state();
         }

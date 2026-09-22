@@ -7,6 +7,59 @@ use crate::compat::Math;
 const SILK_FIX_CONST_19: i32 =
     ((1.5 * core::f64::consts::PI / 1000.0) * (1 << 19) as f64 + 0.5) as i32;
 
+/// Q19/Q28 biquad coefficients of the C fixed-point `hp_cutoff()`
+/// (sigproc_fix.c). Shared by the f32 and i16 entry points.
+fn compute_hp_coeffs(cutoff_hz: i32, fs: i32) -> ([i32; 3], [i32; 2]) {
+    let fc_q19 = silk_div32_16(silk_smulbb(SILK_FIX_CONST_19, cutoff_hz), fs / 1000);
+
+    let r_q28 = (1i32 << 28) - silk_mul(471, fc_q19);
+
+    let b_q28 = [r_q28, -silk_lshift(r_q28, 1), r_q28];
+
+    let r_q22 = silk_rshift(r_q28, 6);
+    let a_q28 = [
+        silk_smulww(r_q22, silk_smulww(fc_q19, fc_q19) - (2i32 << 22)),
+        silk_smulww(r_q22, r_q22),
+    ];
+    (b_q28, a_q28)
+}
+
+/// Native-integer high-pass `hp_cutoff` (C `hp_cutoff()` fixed-point form,
+/// sigproc_fix.c: the C entry point already takes `opus_int16 *in`). Filters
+/// `input` straight through the integer biquad — no f32 round-trip and no
+/// temporary conversion buffer (issue #28).
+pub fn hp_cutoff_i16(
+    input: &[i16],
+    cutoff_hz: i32,
+    output: &mut [i16],
+    hp_mem: &mut [i32],
+    len: usize,
+    channels: usize,
+    fs: i32,
+) {
+    // fs < 1000 makes `fs / 1000` zero and faults in silk_div32_16; callers
+    // inside the encoder always pass a valid Opus rate, but guard direct
+    // calls too (issue #27 deep scan).
+    if fs < 1000 {
+        return;
+    }
+    let (b_q28, a_q28) = compute_hp_coeffs(cutoff_hz, fs);
+
+    if channels == 1 {
+        let s = &mut [hp_mem[0], hp_mem[1]];
+        silk_biquad_alt_stride1(input, &b_q28, &a_q28, s, output);
+        hp_mem[0] = s[0];
+        hp_mem[1] = s[1];
+    } else {
+        let s = &mut [hp_mem[0], hp_mem[1], hp_mem[2], hp_mem[3]];
+        silk_biquad_alt_stride2(input, &b_q28, &a_q28, s, output, len);
+        hp_mem[0] = s[0];
+        hp_mem[1] = s[1];
+        hp_mem[2] = s[2];
+        hp_mem[3] = s[3];
+    }
+}
+
 pub fn hp_cutoff(
     input: &[f32],
     cutoff_hz: i32,
@@ -22,20 +75,7 @@ pub fn hp_cutoff(
     if fs < 1000 {
         return;
     }
-    let mut b_q28 = [0i32; 3];
-    let mut a_q28 = [0i32; 2];
-
-    let fc_q19 = silk_div32_16(silk_smulbb(SILK_FIX_CONST_19, cutoff_hz), fs / 1000);
-
-    let r_q28 = (1i32 << 28) - silk_mul(471, fc_q19);
-
-    b_q28[0] = r_q28;
-    b_q28[1] = -silk_lshift(r_q28, 1);
-    b_q28[2] = r_q28;
-
-    let r_q22 = silk_rshift(r_q28, 6);
-    a_q28[0] = silk_smulww(r_q22, silk_smulww(fc_q19, fc_q19) - (2i32 << 22));
-    a_q28[1] = silk_smulww(r_q22, r_q22);
+    let (b_q28, a_q28) = compute_hp_coeffs(cutoff_hz, fs);
 
     const MAX_HP_INPUT: usize = 11520;
     debug_assert!(input.len() <= MAX_HP_INPUT);

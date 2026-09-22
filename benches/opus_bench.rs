@@ -1,3 +1,7 @@
+// Verification scripts intentionally mirror the C reference style
+// (index-based loops, grouped hex tables) — keep clippy quiet.
+#![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
+
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -902,11 +906,58 @@ fn bench_rate(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_opus_encode_i16(c: &mut Criterion) {
+    // Native PCM16 entry point (issue #28) vs the float path: same audio,
+    // same encoder settings, so the delta shows the saved f32 round-trip.
+    let mut group = c.benchmark_group("opus_encode_i16");
+
+    for &(sample_rate, frame_ms) in &[(8000u32, 20usize), (16000, 20), (16000, 10)] {
+        let frame_size = sample_rate as usize * frame_ms / 1000;
+        let input_i16: Vec<i16> = (0..frame_size)
+            .map(|i| {
+                (0.6 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin()
+                    * 32767.0) as i16
+            })
+            .collect();
+        let input_f32: Vec<f32> = input_i16.iter().map(|&s| s as f32 / 32768.0).collect();
+        let mut output = vec![0u8; 256];
+
+        group.throughput(Throughput::Bytes(frame_size as u64 * 2 /* i16 bytes */));
+        group.bench_with_input(
+            BenchmarkId::new(format!("{sample_rate}Hz/{frame_ms}ms"), "i16_voip"),
+            &(sample_rate, frame_size),
+            |b, &(sr, fs)| {
+                let mut enc = OpusEncoder::new(sr as i32, 1, Application::Voip).unwrap();
+                enc.bitrate_bps = 20_000;
+                b.iter(|| {
+                    enc.encode_i16(black_box(&input_i16), fs, black_box(&mut output))
+                        .unwrap()
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new(format!("{sample_rate}Hz/{frame_ms}ms"), "f32_voip"),
+            &(sample_rate, frame_size),
+            |b, &(sr, fs)| {
+                let mut enc = OpusEncoder::new(sr as i32, 1, Application::Voip).unwrap();
+                enc.bitrate_bps = 20_000;
+                b.iter(|| {
+                    enc.encode(black_box(&input_f32), fs, black_box(&mut output))
+                        .unwrap()
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = configure_criterion();
     targets =
         bench_opus_encode_silk,
+        bench_opus_encode_i16,
         bench_burg_modified,
         bench_autocorr,
         bench_inner_prod,

@@ -17,10 +17,6 @@ use crate::fixedvec::FixedVec;
 fn bitrate_to_bits(bitrate: i32, fs: i32, frame_size: i32) -> i32 {
     bitrate * 6 / (6 * fs / frame_size)
 }
-#[inline]
-fn bits_to_bitrate(bits: i32, fs: i32, frame_size: i32) -> i32 {
-    bits * (6 * fs / frame_size) / 6
-}
 
 const OPUS_BITRATE_MAX: i32 = -1;
 #[allow(clippy::too_many_arguments)]
@@ -74,7 +70,7 @@ fn compute_vbr(
     // tf boost: libopus SHL32(MULT16_32_Q15(tf-0.044, target),1) collapses to (tf-0.044)*target in float
     target += ((tf_estimate - 0.044) * target as f32) as i32;
     if analysis.valid && !lfe {
-        let mut tonal = (analysis.tonality - 0.15).max(0.0) - 0.12;
+        let tonal = (analysis.tonality - 0.15).max(0.0) - 0.12;
         let mut tonal_target = target + ((coded_bins << BITRES) as f32 * 1.2 * tonal) as i32;
         if pitch_change != 0 {
             tonal_target += ((coded_bins << BITRES) as f32 * 0.8) as i32;
@@ -89,7 +85,7 @@ fn compute_vbr(
     // floor depth: only clamp when max_depth is meaningful (>0); stub call passes 0 to avoid spurious 0.665*base
     if max_depth > 0.0 {
         let bins = mode.e_bands[(nb_ebands - 2) as usize] as i32 * (1 << lm);
-        let floor_depth = ((c * bins * (1 << BITRES) as i32) as f32 * max_depth) as i32;
+        let floor_depth = ((c * bins * (1 << BITRES)) as f32 * max_depth) as i32;
         let floor_depth = floor_depth.max(target >> 2);
         target = target.min(floor_depth);
     }
@@ -1384,8 +1380,8 @@ fn run_prefilter(
     }
 
     let enabled = true;
-    let mut pitch_index = COMBFILTER_MINPERIOD;
-    let mut gain1 = 0.0f32;
+    let mut pitch_index: usize;
+    let mut gain1: f32;
     if enabled && toneishness > 0.99 {
         // Tone path (C 1449-1473): bypass the pitch search for pure tones.
         let mut multiple = 1.0f32;
@@ -1630,8 +1626,6 @@ pub struct CeltEncoder {
     vbr_drift: i32,
     vbr_offset: i32,
     vbr_count: i32,
-    spec_avg: f32,
-    stereo_saving: f32,
 
     w_in_buf: FixedVec<f32, CELT_BUFSTRIDE>,
     w_freq: FixedVec<f32, CELT_W_FREQ>,
@@ -1784,10 +1778,10 @@ fn tone_lpc(x: &[f32], len: usize, delay: usize, lpc: &mut [f32; 2]) -> bool {
     }
     let mut r00 = 0.0f32;
     let mut r01 = 0.0f32;
-    let mut r11 = 0.0f32;
     let mut r02 = 0.0f32;
-    let mut r12 = 0.0f32;
-    let mut r22 = 0.0f32;
+    let mut r11: f32;
+    let mut r12: f32;
+    
     for i in 0..len - 2 * delay {
         r00 += x[i] * x[i];
         r01 += x[i] * x[i + delay];
@@ -1802,27 +1796,25 @@ fn tone_lpc(x: &[f32], len: usize, delay: usize, lpc: &mut [f32; 2]) -> bool {
     for i in 0..delay {
         edges += x[len + i - delay] * x[len + i - delay] - x[i + delay] * x[i + delay];
     }
-    r22 = r11 + edges;
+    let r22: f32 = r11 + edges;
     edges = 0.0;
     for i in 0..delay {
         edges += x[len + i - 2 * delay] * x[len + i - delay] - x[i] * x[i + delay];
     }
     r12 = r01 + edges;
     // Reverse and sum to get backward contribution (float: simple sums)
-    let (rr00, rr01, rr11, rr02, rr12, rr22) = (
+    let (rr00, rr01, rr11, rr02, rr12) = (
         r00 + r22,
         r01 + r12,
         2.0 * r11,
         2.0 * r02,
         r12 + r01,
-        r00 + r22,
     );
     r00 = rr00;
     r01 = rr01;
     r11 = rr11;
     r02 = rr02;
     r12 = rr12;
-    r22 = rr22;
     let den = r00 * r11 - r01 * r01;
     if den < 0.001 * r00 * r11 {
         return true;
@@ -2068,7 +2060,7 @@ fn dynalloc_analysis_simple(
         };
 
         // Cap only for CBR / non-transient constrained VBR (libopus 1254-1257)
-        if (!vbr || (constrained_vbr && !is_transient)) {
+        if !vbr || (constrained_vbr && !is_transient) {
             let cap_bits = ((2 * effective_bytes as i32) / 3) << (BITRES + 3);
             if tot_boost + boost_bits > cap_bits {
                 offsets[i] = ((cap_bits - tot_boost) >> BITRES).max(0);
@@ -2136,8 +2128,6 @@ impl CeltEncoder {
             vbr_drift: 0,
             vbr_offset: 0,
             vbr_count: 0,
-            spec_avg: 0.0,
-            stereo_saving: 0.0,
 
             w_in_buf: FixedVec::from_value(0.0, bufstride_x_ch),
             w_freq: FixedVec::from_value(0.0, frame_x_ch + 4),
@@ -2302,13 +2292,7 @@ impl CeltEncoder {
         }
 
         // Tone detection (C 2022): use channel-contiguous in_buf with N+overlap, float path
-        let mut tone_freq = -1.0f32;
-        let mut toneishness = 0.0f32;
-        {
-            let (f, t) = tone_detect(&*in_buf, channels, buf_stride, mode.fs);
-            tone_freq = f;
-            toneishness = t;
-        }
+        let (tone_freq, mut toneishness) = tone_detect(&*in_buf, channels, buf_stride, mode.fs);
         let mut tf_estimate = 0.0f32;
         let mut tf_chan = 0;
         let mut weak_transient = false;
@@ -2782,17 +2766,16 @@ impl CeltEncoder {
                 base_target += self.vbr_offset >> lm_diff;
             }
             let tot_boost = total_boost;
-            let tf_calib = 0; // simplified
             let cur_tell_frac = rc.tell_frac();
             // Use the exact initial tell_frac captured at entry (libopus tell0_frac),
             // not tell_initial<<BITRES which loses the fractional part.
             let min_allowed = {
                 let a = ((cur_tell_frac + tot_boost + (1 << (BITRES + 3)) - 1) >> (BITRES + 3)) + 2;
                 if hybrid {
-                    let b =
-                        ((tell_initial_frac + (37 << BITRES) + tot_boost + (1 << (BITRES + 3))
-                            - 1)
-                            >> (BITRES + 3));
+                    let b = (tell_initial_frac + (37 << BITRES) + tot_boost
+                        + (1 << (BITRES + 3))
+                        - 1)
+                        >> (BITRES + 3);
                     a.max(b)
                 } else {
                     a
@@ -2844,7 +2827,7 @@ impl CeltEncoder {
             target = (nb_available as i32) << (BITRES + 3);
             if silence {
                 nb_available = 2;
-                target = 2 * 8 << BITRES;
+                target = (2 * 8) << BITRES;
                 delta = 0;
             }
             // Reservoir / drift update (libopus 2502-2529)
@@ -2854,7 +2837,7 @@ impl CeltEncoder {
             let alpha = if self.vbr_count < 970 {
                 // celt_rcp((vbr_count+20)<<16) in Q15 is 32768/(vbr_count+20)
                 let v = self.vbr_count + 20;
-                (32768 / v) as i32 // Q15
+                32768 / v  // Q15
             } else {
                 33 // QCONST16(0.001,15) ~33
             };

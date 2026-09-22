@@ -1,3 +1,7 @@
+// Verification scripts intentionally mirror the C reference style
+// (index-based loops, grouped hex tables) — keep clippy quiet.
+#![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
+
 use opus_rs::modes::default_mode;
 use opus_rs::range_coder::RangeCoder;
 use opus_rs::rate::{BITRES, clt_compute_allocation, pulses2bits};

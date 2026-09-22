@@ -1,3 +1,7 @@
+// Verification scripts intentionally mirror the C reference style
+// (index-based loops, grouped hex tables) — keep clippy quiet.
+#![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
+
 // WAV file encoder/decoder test using OpusEncoder/OpusDecoder
 use opus_rs::silk::resampler::SilkResampler;
 use opus_rs::{Application, OpusDecoder, OpusEncoder};

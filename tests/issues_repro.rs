@@ -22,8 +22,8 @@ fn issue_10_code2_first_frame_200_bytes() {
     // code 2, first frame 200 bytes. RFC 6716 §3.2.1 writes 200 as the
     // single byte 0xC8 — any value below 252 is a one-byte length.
     let mut a = vec![0xfa_u8, 0xC8];
-    a.extend(std::iter::repeat(0xAA).take(200)); // frame 1
-    a.extend(std::iter::repeat(0xBB).take(50)); // frame 2
+    a.extend(std::iter::repeat_n(0xAA, 200)); // frame 1
+    a.extend(std::iter::repeat_n(0xBB, 50)); // frame 2
     let mut dec = OpusDecoder::new(48000, 1).unwrap();
     let mut pcm = vec![0.0f32; 1920];
     let res = dec.decode(&a, 1920, &mut pcm);
@@ -38,8 +38,8 @@ fn issue_10_code3_vbr_first_frame_300_bytes() {
     // code 3, VBR, 2 frames, first frame 300 bytes.
     // RFC writes 300 as [252, 12] -> 12 * 4 + 252 = 300.
     let mut b = vec![0xfb_u8, 0x82, 252, 12];
-    b.extend(std::iter::repeat(0xAA).take(300));
-    b.extend(std::iter::repeat(0xBB).take(50));
+    b.extend(std::iter::repeat_n(0xAA, 300));
+    b.extend(std::iter::repeat_n(0xBB, 50));
     let mut dec = OpusDecoder::new(48000, 1).unwrap();
     let mut pcm = vec![0.0f32; 1920];
     let res = dec.decode(&b, 1920, &mut pcm);
@@ -54,8 +54,8 @@ fn issue_10_control_code2_first_frame_100_bytes() {
     // control: same shape with a 100-byte first frame, below the 128 threshold,
     // where both schemes happen to agree.
     let mut c = vec![0xfa_u8, 100];
-    c.extend(std::iter::repeat(0xAA).take(100));
-    c.extend(std::iter::repeat(0xBB).take(50));
+    c.extend(std::iter::repeat_n(0xAA, 100));
+    c.extend(std::iter::repeat_n(0xBB, 50));
     let mut dec = OpusDecoder::new(48000, 1).unwrap();
     let mut pcm = vec![0.0f32; 1920];
     let res = dec.decode(&c, 1920, &mut pcm);

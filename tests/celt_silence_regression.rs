@@ -1,3 +1,7 @@
+// Verification scripts intentionally mirror the C reference style
+// (index-based loops, grouped hex tables) — keep clippy quiet.
+#![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
+
 //! Regression tests for CELT silence handling (issue #silence)
 //! Covers:
 //! - CELT-only zero PCM via OpusEncoder -> libopus/ffmpeg cross-decode
@@ -67,7 +71,7 @@ fn ogg_page(serial: u32, seq: u32, granule: u64, header_type: u8, payload: &[u8]
     page
 }
 fn mux_ogg(packets: &[Vec<u8>]) -> Vec<u8> {
-    const SERIAL: u32 = 0x4f7075_73;
+    const SERIAL: u32 = 0x4F70_7573;
     let mut head = Vec::new();
     head.extend_from_slice(b"OpusHead");
     head.push(1);
@@ -147,45 +151,6 @@ fn max_abs(v: &[f32]) -> f32 {
 }
 fn is_finite_all(v: &[f32]) -> bool {
     v.iter().all(|x| x.is_finite())
-}
-fn encode_frames(enc: &mut OpusEncoder, pcm: &[f32], frame_size: usize) -> Vec<Vec<u8>> {
-    let frames = pcm.len() / (enc_sampling_rate(enc) as usize * 2 / 48000 * frame_size / 960 * 2); // dummy
-    // simpler: pcm.len() / (2*frame_size)
-    let n_frames = pcm.len() / (2 * frame_size);
-    let mut packets = Vec::new();
-    let mut out = vec![0u8; 1500];
-    for f in 0..n_frames {
-        let chunk = &pcm[f * frame_size * 2..(f + 1) * frame_size * 2];
-        let n = enc.encode(chunk, frame_size, &mut out).expect("encode");
-        packets.push(out[..n].to_vec());
-    }
-    let _ = frames;
-    packets
-}
-fn enc_sampling_rate(enc: &OpusEncoder) -> i32 {
-    // Access via OpusEncoder fields? We pass sampling_rate explicitly.
-    48000
-}
-
-/// Check that decoded pcm for a silence region is near-silent (small amplitude, no burst)
-fn assert_near_silence(decoded: &[f32], start_frame: usize, n_frames: usize, channels: usize) {
-    let fs = FRAME_SIZE;
-    let start = start_frame * fs * channels;
-    let end = (start_frame + n_frames) * fs * channels;
-    let end = end.min(decoded.len());
-    let slice = &decoded[start..end];
-    assert!(is_finite_all(slice), "NaN/Inf in decoded silence region");
-    let m = max_abs(slice);
-    // Allow small leakage due to transient? For pure silence after 2 frames, should be 0.
-    // For cross-decoded via ffmpeg, allow up to 0.01 (libopus may have tiny noise)
-    assert!(
-        m < 0.05,
-        "silence region not silent: max_abs {} too high (expected near 0)",
-        m
-    );
-    // energy check
-    let energy: f32 = slice.iter().map(|x| x * x).sum::<f32>() / slice.len().max(1) as f32;
-    assert!(energy < 1e-4, "silence region energy {} too high", energy);
 }
 
 #[test]
@@ -331,8 +296,8 @@ fn audio_to_silence_to_audio_transition() {
         "burst {}",
         max_abs(&decoded_all)
     );
-    if ffmpeg_available() {
-        if let Some(ff) = decode_with_ffmpeg(&packets) {
+    if ffmpeg_available()
+        && let Some(ff) = decode_with_ffmpeg(&packets) {
             assert!(is_finite_all(&ff));
             let m = max_abs(&ff);
             assert!(m < 1.0, "ffmpeg burst {}", m);
@@ -345,7 +310,6 @@ fn audio_to_silence_to_audio_transition() {
             // We'll just check overall no huge burst
             assert!(m < 1.0);
         }
-    }
 }
 
 #[test]
@@ -374,8 +338,8 @@ fn repeated_silence_no_burst() {
                 max_abs(&o)
             );
         }
-        if ffmpeg_available() {
-            if let Some(ff) = decode_with_ffmpeg(&packets) {
+        if ffmpeg_available()
+            && let Some(ff) = decode_with_ffmpeg(&packets) {
                 assert!(is_finite_all(&ff));
                 let m = max_abs(&ff);
                 assert!(
@@ -394,7 +358,6 @@ fn repeated_silence_no_burst() {
                     );
                 }
             }
-        }
     }
 }
 
@@ -446,13 +409,12 @@ fn near_silence_threshold() {
     pkts.push(out[..n].to_vec());
     let n = enc2.encode(&above, FRAME_SIZE, &mut out).unwrap();
     pkts.push(out[..n].to_vec());
-    if ffmpeg_available() {
-        if let Some(dec) = decode_with_ffmpeg(&pkts) {
+    if ffmpeg_available()
+        && let Some(dec) = decode_with_ffmpeg(&pkts) {
             assert!(is_finite_all(&dec));
             let m = max_abs(&dec);
             assert!(m < 1.0, "near silence ffmpeg burst {}", m);
         }
-    }
 }
 
 #[test]
@@ -517,12 +479,11 @@ fn hybrid_zero_sanity() {
         "hybrid zero decode not silent {}",
         max_abs(&o)
     );
-    if ffmpeg_available() {
-        if let Some(ff) = decode_with_ffmpeg(&vec![out[..n].to_vec()]) {
+    if ffmpeg_available()
+        && let Some(ff) = decode_with_ffmpeg(&[out[..n].to_vec()]) {
             assert!(is_finite_all(&ff));
             assert!(max_abs(&ff) < 0.5, "hybrid ffmpeg burst {}", max_abs(&ff));
         }
-    }
 }
 
 #[test]

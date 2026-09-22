@@ -1,3 +1,7 @@
+// Verification scripts intentionally mirror the C reference style
+// (index-based loops, grouped hex tables) — keep clippy quiet.
+#![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
+
 use opus_rs::silk::define::*;
 use opus_rs::silk::pitch_analysis::silk_pitch_analysis_core;
 use std::f32::consts::PI;

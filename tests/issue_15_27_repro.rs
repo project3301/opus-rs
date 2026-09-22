@@ -45,14 +45,13 @@ fn aligned_snr(inp: &[f32], out: &[f32], start: usize, len: usize, max_delay: us
 
 fn sine_input(frame: usize, sample_rate: usize, channels: usize) -> Vec<f32> {
     (0..frame)
-        .map(|i| {
+        .flat_map(|i| {
             let s = (2.0 * PI * 440.0 * (i as f32 / sample_rate as f32)).sin() * 0.3;
             let mut pair = [0.0f32; 2];
             pair[0] = s;
             pair[1] = if channels == 2 { s } else { 0.0 };
             pair
         })
-        .flat_map(|p| p)
         .take(frame * channels)
         .collect()
 }

@@ -6,21 +6,13 @@ use crate::silk::macros::{
 const STEREO_INTERP_LEN_MS: i32 = 8;
 
 /// Persistent stereo decoder state (mirrors libopus `stereo_dec_state`).
+#[derive(Default)]
 pub struct StereoDecState {
     pub pred_prev_q13: [i32; 2],
     pub s_mid: [i16; 2],
     pub s_side: [i16; 2],
 }
 
-impl Default for StereoDecState {
-    fn default() -> Self {
-        Self {
-            pred_prev_q13: [0; 2],
-            s_mid: [0; 2],
-            s_side: [0; 2],
-        }
-    }
-}
 
 /// Convert adaptive Mid/Side representation to Left/Right stereo signal.
 /// Ported from libopus `silk/stereo_MS_to_LR.c`.

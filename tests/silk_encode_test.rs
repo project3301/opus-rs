@@ -1,3 +1,7 @@
+// Verification scripts intentionally mirror the C reference style
+// (index-based loops, grouped hex tables) — keep clippy quiet.
+#![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
+
 /// SILK end-to-end encode test
 /// Tests that silk_encode_frame runs without crashing and produces valid output
 use opus_rs::range_coder::RangeCoder;

@@ -294,7 +294,7 @@ impl MdctLookup {
         // paths, read out of bounds instead of panicking (issue #27 deep
         // scan).
         assert!(
-            input.len() >= stride * (n2 - 1) + 1,
+            input.len() > stride * (n2 - 1),
             "MDCT backward: input too small (need {}, have {})",
             stride * (n2 - 1) + 1,
             input.len()

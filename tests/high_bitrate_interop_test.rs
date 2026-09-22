@@ -1,3 +1,7 @@
+// Verification scripts intentionally mirror the C reference style
+// (index-based loops, grouped hex tables) — keep clippy quiet.
+#![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
+
 //! High-bitrate CELT interop reproduction for issue #11.
 //!
 //! Encodes stereo signals at 128–192 kbps with the crate encoder, then decodes
@@ -160,7 +164,7 @@ fn ogg_page(serial: u32, seq: u32, granule: u64, header_type: u8, payload: &[u8]
 }
 
 fn mux_ogg(packets: &[Vec<u8>]) -> Vec<u8> {
-    const SERIAL: u32 = 0x4f7075_73; // "Opus"
+    const SERIAL: u32 = 0x4f70_7573; // "Opus"
     let mut head = Vec::new();
     head.extend_from_slice(b"OpusHead");
     head.push(1); // version

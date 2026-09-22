@@ -1,3 +1,7 @@
+// Verification scripts intentionally mirror the C reference style
+// (index-based loops, grouped hex tables) — keep clippy quiet.
+#![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
+
 /// Test to compare Rust SILK encoder output with C reference
 ///
 /// Note: `test_silk_bitstream_vs_c_reference` was removed because it compared our

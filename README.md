@@ -24,6 +24,12 @@ let input = vec![0.0f32; 320]; // 20ms frame at 16kHz
 let mut output = vec![0u8; 256];
 let bytes = encoder.encode(&input, 320, &mut output).unwrap();
 
+// Encode PCM16 directly (issue #28): skip the f32 round-trip in the
+// SILK/VoIP path. Output is byte-for-byte identical to `encode()` called
+// with the same audio converted via `sample as f32 / 32768.0`.
+let input_i16 = vec![0i16; 320]; // 20ms frame at 16kHz
+let bytes = encoder.encode_i16(&input_i16, 320, &mut output).unwrap();
+
 // Decode
 let mut decoder = OpusDecoder::new(16000, 1).unwrap();
 let mut pcm = vec![0.0f32; 320];
@@ -109,6 +115,25 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
 
 
 ## Release Notes
+
+### 0.1.34
+
+- **New: `OpusEncoder::encode_i16()` — native PCM16 entry point (issue #28).**
+  Callers holding PCM16 audio no longer need to convert to f32 before encoding.
+  In the SILK/VoIP path the integer high-pass biquad (`hp_cutoff_i16`) is fed
+  directly from the input — no f32 round-trip, no `[i16; 11520]` temporary
+  conversion buffer. Output is byte-for-byte identical to `encode()` called
+  with the same audio converted via `sample as f32 / 32768.0` (SILK-only,
+  Hybrid and CELT-only modes; verified by a parity test matrix across
+  8/12/16/24/48 kHz, mono/stereo, complexity 0-10, CBR/VBR, in-band FEC).
+  The float `encode()` API is unchanged.
+- **Fix: `no_std` builds (`--no-default-features --features libm`) compile
+  again.** The `multistream` decode module (added in 0.1.33) uses `Vec`-based
+  plumbing and is now gated behind the default `std` feature; the core codec
+  remains heap-free `no_std`.
+- **Zero warnings:** `cargo check` and `cargo clippy --all-targets` are clean
+  for the default and `no_std` feature sets (dead CELT state fields removed,
+  tests/examples/benches lint-clean).
 
 ### 0.1.29
 

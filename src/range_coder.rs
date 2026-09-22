@@ -48,7 +48,7 @@ pub struct RangeCoder {
 
 impl RangeCoder {
     pub fn new_encoder(size: u32) -> Self {
-        let size = (size as usize).min(RANGE_BUF_MAX).max(1);
+        let size = (size as usize).clamp(1, RANGE_BUF_MAX);
         let buf = FixedVec::from_value(0u8, size);
         RangeCoder {
             buf,
@@ -68,7 +68,7 @@ impl RangeCoder {
 
     #[inline]
     pub fn reset_for_encode(&mut self, size: u32) {
-        let size = (size as usize).min(RANGE_BUF_MAX).max(1);
+        let size = (size as usize).clamp(1, RANGE_BUF_MAX);
         self.buf.resize(size, 0);
         self.storage = size as u32;
         self.end_offs = 0;

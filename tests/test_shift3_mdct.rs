@@ -1,3 +1,7 @@
+// Verification scripts intentionally mirror the C reference style
+// (index-based loops, grouped hex tables) — keep clippy quiet.
+#![allow(clippy::needless_range_loop, clippy::unreadable_literal)]
+
 #[test]
 fn test_mdct_shift3() {
     use opus_rs::modes::default_mode;
@@ -61,7 +65,7 @@ fn test_mdct_shift3() {
         output.len(),
         output.iter().map(|f| f.abs()).fold(0.0f32, f32::max)
     );
-    eprintln!("Full output: {:?}", &output);
+    eprintln!("Full output: {:?}", output);
 
     // The reconstructed signal should be at output[overlap/2 + overlap..]
     // because output[0..overlap] is the overlap tail from previous frame (zero in our case)
