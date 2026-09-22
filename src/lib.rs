@@ -13,6 +13,7 @@ pub mod hp_cutoff;
 pub mod kiss_fft;
 pub mod mdct;
 pub mod modes;
+pub mod multistream;
 pub mod pitch;
 pub mod pvq;
 pub mod quant_bands;
@@ -2009,7 +2010,7 @@ fn smooth_fade(
 ///   - `252..=255`: a second byte is read; length = `second*4 + first`
 ///
 /// Returns `(length, bytes_consumed)`.
-fn parse_frame_size(data: &[u8]) -> Result<(usize, usize), &'static str> {
+pub(crate) fn parse_frame_size(data: &[u8]) -> Result<(usize, usize), &'static str> {
     let first = *data.first().ok_or("truncated frame length")? as usize;
     if first < 252 {
         Ok((first, 1))
