@@ -2575,7 +2575,7 @@ pub fn compute_band_energies(
     let frame_size = m.short_mdct_size << lm;
 
     #[cfg(target_arch = "x86_64")]
-    let use_avx2 = crate::compat::x86_has_avx2();
+    let use_avx2 = crate::compat::x86_has_avx2_fma();
 
     for c in 0..channels {
         let ch = &x[c * frame_size..(c + 1) * frame_size];
@@ -2924,7 +2924,7 @@ pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        if n >= 16 && crate::compat::x86_has_avx2() {
+        if n >= 16 && crate::compat::x86_has_avx2_fma() {
             renormalise_vector_avx2(x, n, gain);
             return;
         }

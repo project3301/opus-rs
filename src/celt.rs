@@ -821,7 +821,7 @@ fn comb_filter_const(
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
-        if crate::compat::x86_has_avx() {
+        if crate::compat::x86_has_avx_fma() {
             comb_filter_const_avx(y, x, y_idx, x_idx, t, n, g10, g11, g12);
             return;
         }
