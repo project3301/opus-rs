@@ -207,6 +207,10 @@ fn issue_27_2a_stereo_40ms_roundtrip_both_frames_consistent() {
 /// header before every LBRR payload; the encoder used to write none, so any
 /// stereo packet carrying LBRR desynced immediately. The LBRR section must
 /// also gracefully degrade when it does not fit the packet budget.
+///
+/// At CBR the LBRR section never fits, so this covers the budget fallback;
+/// `issue_27_libopus_oracle.rs` uses VBR to check the LBRR payloads
+/// themselves against libopus.
 #[test]
 fn issue_27_2b_stereo_fec_roundtrip_consistent() {
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
@@ -279,6 +283,7 @@ fn issue_27_3_silk_40ms_resampled_full_decode() {
     let enc_frame = 640; // 40 ms @ 16 kHz
 
     let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut c_dec = opus::Decoder::new(48000, opus::Channels::Mono).unwrap();
     let dec_frame = 1920; // 40 ms @ 48 kHz
     for pkt_idx in 0..3 {
         let input = sine_input(enc_frame, 16000, 1);
@@ -290,21 +295,44 @@ fn issue_27_3_silk_40ms_resampled_full_decode() {
             .expect("decode 40 ms @ 48 kHz");
         assert_eq!(samples, dec_frame);
 
-        // Issue #27-3 fix target: the second half must contain actual decoded
-        // content (it used to be exact zeros), and the reported length must
-        // cover the whole packet. (The residual SNR of the 16k->48k resampled
-        // multi-frame path is a separate pre-existing quality issue: the
-        // baseline also scored only ~0.2 dB here.)
-        let rms_second: f64 = pcm[dec_frame / 2..dec_frame]
-            .iter()
-            .map(|v| (*v as f64).powi(2))
-            .sum::<f64>();
-        let rms_second = (rms_second / (dec_frame / 2) as f64).sqrt();
-        assert!(
-            rms_second > 1e-2,
-            "pkt {pkt_idx}: second half zeros (rms={rms_second:.5}): only first SILK frame decoded"
-        );
+        // Both halves must match libopus decoding the same packet. (An
+        // earlier note here blamed a "~0.2 dB" pre-existing resampler issue;
+        // that figure compared 16 kHz input against 48 kHz output sample by
+        // sample.) The lag search absorbs a constant offset: opus-rs's mono
+        // SILK output runs one internal sample (3 samples at 48 kHz) ahead of
+        // libopus, which delays mono through the stereo sMid buffer.
+        let mut c_pcm = vec![0.0f32; dec_frame];
+        let c_n = c_dec.decode_float(&pkt[..n], &mut c_pcm, false).unwrap();
+        assert_eq!(c_n, dec_frame);
+        for (half, start) in [(1, 0), (2, dec_frame / 2)] {
+            let snr = libopus_match_snr(&c_pcm, &pcm, start + 8, dec_frame / 2 - 16);
+            assert!(
+                snr > 60.0,
+                "pkt {pkt_idx}, half {half}: diverges from libopus ({snr:.1} dB)"
+            );
+        }
     }
+}
+
+/// Best SNR of `test` against `reference[start..start + len]` over lags
+/// -8..=8 in either direction.
+fn libopus_match_snr(reference: &[f32], test: &[f32], start: usize, len: usize) -> f64 {
+    (-8isize..=8)
+        .map(|lag| {
+            let (mut sig, mut err) = (0f64, 0f64);
+            for i in start..start + len {
+                let r = reference[i] as f64;
+                let t = test[(i as isize + lag) as usize] as f64;
+                sig += r * r;
+                err += (r - t) * (r - t);
+            }
+            if sig == 0.0 {
+                f64::NEG_INFINITY
+            } else {
+                10.0 * (sig / err.max(1e-20)).log10()
+            }
+        })
+        .fold(f64::NEG_INFINITY, f64::max)
 }
 
 // ---------------------------------------------------------------------------

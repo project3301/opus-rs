@@ -459,7 +459,7 @@ fn encode_lbrr_section(
             let lbrr_cond = if i > 0 && ps_enc.s_cmn.lbrr_flags[i - 1] != 0 {
                 CODE_CONDITIONALLY
             } else {
-                CODE_INDEPENDENTLY_NO_LTP_SCALING
+                CODE_INDEPENDENTLY
             };
             // libopus writes the stereo header (pred + conditional mid-only
             // flag) before every LBRR payload; the decoder's LBRR skip path
@@ -698,12 +698,18 @@ pub fn silk_encode(
             if fi < MAX_FRAMES_PER_PACKET {
                 ps_enc.s_cmn.indices_lbrr[fi] = ps_enc.s_cmn.indices;
 
-                let gain_inc = ps_enc.s_cmn.lbrr_gain_increases.clamp(0, 16) as i8;
-                for g in 0..ps_enc.s_cmn.nb_subfr as usize {
-                    let new_gain = (ps_enc.s_cmn.indices_lbrr[fi].gains_indices[g] as i32
-                        + gain_inc as i32)
-                        .min(63) as i8;
-                    ps_enc.s_cmn.indices_lbrr[fi].gains_indices[g] = new_gain;
+                // Like libopus silk_LBRR_encode: raise only the first gain
+                // index, and only when this LBRR frame is coded independently
+                // (absolute index, 0..=63). Indices 1.. — and index 0 of a
+                // conditionally coded frame — are deltas into the 41-entry
+                // SILK_DELTA_GAIN_ICDF; raising those could push a symbol past
+                // the table.
+                let coded_independently =
+                    fi == 0 || ps_enc.s_cmn.indices_lbrr[fi - 1].signal_type < TYPE_UNVOICED as i8;
+                if coded_independently {
+                    let gain_inc = ps_enc.s_cmn.lbrr_gain_increases.clamp(0, 16);
+                    let g0 = &mut ps_enc.s_cmn.indices_lbrr[fi].gains_indices[0];
+                    *g0 = (*g0 as i32 + gain_inc).min(N_LEVELS_QGAIN - 1) as i8;
                 }
 
                 ps_enc.s_cmn.pulses_lbrr[fi] = ps_enc.pulses;

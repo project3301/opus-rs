@@ -1,0 +1,401 @@
+//! Issue #27 checked against libopus (the `opus` dev-dependency).
+//!
+//! `issue_15_27_repro.rs` covers #27 with opus-rs on both ends of the wire,
+//! which cannot see a bug the encoder and decoder share (the original part 2
+//! desync was found with the C decoder). These tests put libopus on one side:
+//!
+//! - libopus encodes 40/60 ms SILK packets and opus-rs decodes them at 48 kHz
+//!   with a 120 ms output buffer — what a Discord voice receiver does. Every
+//!   20 ms window must match libopus's own decode of the same packets, so a
+//!   silent or garbled 2nd/3rd SILK frame fails on its own window.
+//! - opus-rs encodes 40 ms stereo SILK, and 20 ms SILK with in-band FEC, and
+//!   libopus decodes it: each window must track the input as well as plain
+//!   20 ms packets do, and libopus must recover lost frames from the LBRR
+//!   section.
+
+use opus::{
+    Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
+    Encoder as CEnc, Signal as CSignal,
+};
+use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use std::f32::consts::PI;
+
+/// Largest Opus frame per channel: 120 ms at 48 kHz.
+const MAX_FRAME: usize = 5760;
+
+fn c_channels(ch: usize) -> CCh {
+    if ch == 2 { CCh::Stereo } else { CCh::Mono }
+}
+
+/// Voiced-speech-like test signal: a 140 Hz harmonic series with slow pitch
+/// drift and a syllable-rate envelope. The right channel is a scaled, phase
+/// shifted copy so the stereo side signal is not trivially zero.
+fn voiced(sr: usize, ch: usize, n: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n * ch);
+    let mut phase = 0.0f32;
+    for i in 0..n {
+        let t = i as f32 / sr as f32;
+        let f0 = 140.0 + 15.0 * (2.0 * PI * 0.7 * t).sin();
+        phase += 2.0 * PI * f0 / sr as f32;
+        let env = 0.6 + 0.4 * (2.0 * PI * 3.0 * t).sin();
+        let mut l = 0.0;
+        let mut r = 0.0;
+        for h in 1..=8 {
+            let a = 0.25 / h as f32;
+            l += a * (h as f32 * phase).sin();
+            r += a * (h as f32 * phase + 0.3 * h as f32).sin();
+        }
+        out.push(l * env * 0.5);
+        if ch == 2 {
+            out.push(r * env * 0.4);
+        }
+    }
+    out
+}
+
+fn channel(pcm: &[f32], ch: usize, c: usize) -> Vec<f32> {
+    pcm.iter().skip(c).step_by(ch).copied().collect()
+}
+
+/// SNR of `test` against `reference` (in dB), at the best lag in
+/// `-max_lag..=max_lag`, over `reference[start..start + len]`.
+fn best_lag_snr(reference: &[f32], test: &[f32], start: usize, len: usize, max_lag: isize) -> f64 {
+    let mut best = f64::NEG_INFINITY;
+    for lag in -max_lag..=max_lag {
+        let (mut sig, mut err) = (0f64, 0f64);
+        for i in start..start + len {
+            let j = i as isize + lag;
+            if j < 0 || j as usize >= test.len() || i >= reference.len() {
+                continue;
+            }
+            let r = reference[i] as f64;
+            let e = r - test[j as usize] as f64;
+            sig += r * r;
+            err += e * e;
+        }
+        if sig > 0.0 {
+            best = best.max(10.0 * (sig / err.max(1e-20)).log10());
+        }
+    }
+    best
+}
+
+/// Per-window SNR (worst channel) of `test` against `reference`, both
+/// interleaved with `ch` channels, over consecutive `win`-sample windows
+/// after skipping `skip` samples of warm-up.
+fn window_snrs(
+    reference: &[f32],
+    test: &[f32],
+    ch: usize,
+    win: usize,
+    skip: usize,
+    max_lag: isize,
+) -> Vec<f64> {
+    let refs: Vec<Vec<f32>> = (0..ch).map(|c| channel(reference, ch, c)).collect();
+    let tests: Vec<Vec<f32>> = (0..ch).map(|c| channel(test, ch, c)).collect();
+    let n = refs[0].len().min(tests[0].len());
+    let mut out = Vec::new();
+    let mut start = skip;
+    while start + win + max_lag as usize <= n {
+        let worst = (0..ch)
+            .map(|c| best_lag_snr(&refs[c], &tests[c], start, win, max_lag))
+            .fold(f64::INFINITY, f64::min);
+        out.push(worst);
+        start += win;
+    }
+    out
+}
+
+/// TOC check: SILK-only (configs 0..=11), `ch` channels, and `ms` of audio
+/// in total. Returns (SILK frames per Opus frame, Opus frames in the packet):
+/// a 60 ms SILK frame carries 3 SILK frames inside one Opus frame.
+fn assert_silk_toc(pkt: &[u8], ch: usize, ms: usize) -> (usize, usize) {
+    let toc = pkt[0];
+    let config = toc >> 3;
+    assert!(config <= 11, "expected SILK-only TOC, got config {config}");
+    let stereo = (toc >> 2) & 1 == 1;
+    assert_eq!(stereo, ch == 2, "TOC stereo bit");
+    let dur = [10, 20, 40, 60][(config & 3) as usize];
+    let count = match toc & 3 {
+        0 => 1,
+        1 | 2 => 2,
+        _ => (pkt[1] & 0x3f) as usize,
+    };
+    assert_eq!(
+        dur * count,
+        ms,
+        "TOC duration (config {config}, {count} frames)"
+    );
+    ((dur / 20).max(1), count)
+}
+
+const LAG_MS: usize = 40;
+
+/// Mid signal (L+R)/2 of interleaved `ch`-channel audio (identity for mono).
+fn mid(pcm: &[f32], ch: usize) -> Vec<f32> {
+    pcm.chunks_exact(ch)
+        .map(|p| p.iter().sum::<f32>() / ch as f32)
+        .collect()
+}
+
+fn min(v: &[f64]) -> f64 {
+    v.iter().copied().fold(f64::INFINITY, f64::min)
+}
+
+// ---------------------------------------------------------------------------
+// Part 3: libopus-encoded multi-frame SILK -> opus-rs decoder at 48 kHz
+// ---------------------------------------------------------------------------
+
+/// Encode ~1 s with libopus at `ms` frames, decode each packet with libopus
+/// and with opus-rs (48 kHz, 120 ms output buffer), and return opus-rs's
+/// per-20 ms-window SNR against libopus.
+fn c_enc_rust_dec(ch: usize, ms: usize) -> Vec<f64> {
+    let sr = 48000;
+    let frame = sr * ms / 1000;
+    let packets = 1000 / ms;
+    let input = voiced(sr, ch, frame * packets);
+
+    let mut enc = CEnc::new(sr as u32, c_channels(ch), CApp::Voip).unwrap();
+    enc.set_bitrate(CBitrate::Bits(24000)).unwrap();
+    enc.set_bandwidth(CBw::Wideband).unwrap();
+    // A steady harmonic tone can read as music and pull libopus into CELT.
+    enc.set_signal(CSignal::Voice).unwrap();
+    let mut c_dec = CDec::new(sr as u32, c_channels(ch)).unwrap();
+    let mut rs_dec = OpusDecoder::new(sr as i32, ch).unwrap();
+
+    let (mut c_pcm, mut rs_pcm) = (Vec::new(), Vec::new());
+    let mut pkt = vec![0u8; 1500];
+    let mut c_buf = vec![0f32; MAX_FRAME * ch];
+    let mut rs_buf = vec![0f32; MAX_FRAME * ch];
+    for p in 0..packets {
+        let n = enc
+            .encode_float(&input[p * frame * ch..(p + 1) * frame * ch], &mut pkt)
+            .unwrap();
+        assert_silk_toc(&pkt[..n], ch, ms);
+
+        let c_n = c_dec.decode_float(&pkt[..n], &mut c_buf, false).unwrap();
+        let rs_n = rs_dec
+            .decode(&pkt[..n], MAX_FRAME, &mut rs_buf)
+            .unwrap_or_else(|e| panic!("packet {p}: opus-rs decode failed: {e}"));
+        assert_eq!(c_n, frame, "libopus decoded length");
+        assert_eq!(rs_n, frame, "packet {p}: opus-rs decoded length");
+        c_pcm.extend_from_slice(&c_buf[..c_n * ch]);
+        rs_pcm.extend_from_slice(&rs_buf[..rs_n * ch]);
+    }
+    // Skip the first packet (encoder/decoder warm-up); windows are 20 ms.
+    window_snrs(&c_pcm, &rs_pcm, ch, 960, frame, 30)
+}
+
+fn check_matches_libopus(ch: usize, ms: usize) {
+    let snrs = c_enc_rust_dec(ch, ms);
+    let worst = min(&snrs);
+    println!(
+        "C enc {ms} ms {ch}ch -> opus-rs dec @48k: {} windows, worst {worst:.1} dB",
+        snrs.len()
+    );
+    assert!(
+        worst > MATCH_DB,
+        "{ms} ms {ch}ch: opus-rs output diverges from libopus; per-window SNR: {snrs:.1?}"
+    );
+}
+
+/// How closely opus-rs must match libopus when both decode the same packets.
+/// Set with margin under the 20 ms baseline measured by
+/// `libopus_20ms_baseline_matches` below. A dropped or garbled SILK frame
+/// scores around 0 dB, far below this.
+const MATCH_DB: f64 = 30.0;
+
+#[test]
+fn libopus_20ms_baseline_matches() {
+    check_matches_libopus(1, 20);
+    check_matches_libopus(2, 20);
+}
+
+#[test]
+fn libopus_40ms_mono_decodes_every_silk_frame() {
+    check_matches_libopus(1, 40);
+}
+
+#[test]
+fn libopus_60ms_mono_decodes_every_silk_frame() {
+    check_matches_libopus(1, 60);
+}
+
+#[test]
+fn libopus_40ms_stereo_decodes_every_silk_frame() {
+    check_matches_libopus(2, 40);
+}
+
+#[test]
+fn libopus_60ms_stereo_decodes_every_silk_frame() {
+    check_matches_libopus(2, 60);
+}
+
+// ---------------------------------------------------------------------------
+// Parts 1 and 2: opus-rs-encoded SILK -> libopus decoder
+// ---------------------------------------------------------------------------
+
+/// Per-window SNRs from one opus-rs-encoded stream decoded by libopus.
+struct RustEncoded {
+    /// Normal decode against the input (mid channel).
+    normal: Vec<f64>,
+    /// libopus `decode_fec` output (the previous packet recovered from LBRR)
+    /// against the input; empty without FEC.
+    lbrr: Vec<f64>,
+    /// opus-rs's own decode of the same packets against libopus's.
+    agreement: Vec<f64>,
+}
+
+/// Encode ~1 s with opus-rs at 16 kHz and `ms` frames, and decode it with
+/// libopus and with opus-rs. With `fec`, also decode every packet through a
+/// second libopus decoder with `fec = true`.
+fn rust_enc_c_dec(ch: usize, ms: usize, fec: bool, cbr: bool) -> RustEncoded {
+    let sr = 16000;
+    let frame = sr * ms / 1000;
+    let packets = 1000 / ms;
+    let input = voiced(sr, ch, frame * packets);
+
+    let mut enc = OpusEncoder::new(sr as i32, ch, Application::Voip).unwrap();
+    enc.bitrate_bps = 32000;
+    enc.use_cbr = cbr;
+    if fec {
+        enc.use_inband_fec = true;
+        enc.packet_loss_perc = 40;
+    }
+    let mut c_dec = CDec::new(sr as u32, c_channels(ch)).unwrap();
+    let mut c_fec = CDec::new(sr as u32, c_channels(ch)).unwrap();
+    let mut rs_dec = OpusDecoder::new(sr as i32, ch).unwrap();
+
+    let (mut pcm, mut fec_pcm, mut rs_pcm) = (Vec::new(), Vec::new(), Vec::new());
+    let mut pkt = vec![0u8; 1500];
+    let mut buf = vec![0f32; MAX_FRAME * ch];
+    for p in 0..packets {
+        let n = enc
+            .encode(
+                &input[p * frame * ch..(p + 1) * frame * ch],
+                frame,
+                &mut pkt,
+            )
+            .unwrap_or_else(|e| panic!("packet {p}: opus-rs encode failed: {e}"));
+        assert_silk_toc(&pkt[..n], ch, ms);
+
+        let got = c_dec
+            .decode_float(&pkt[..n], &mut buf, false)
+            .unwrap_or_else(|e| panic!("packet {p}: libopus rejected opus-rs packet: {e}"));
+        assert_eq!(got, frame);
+        pcm.extend_from_slice(&buf[..got * ch]);
+
+        let got = rs_dec.decode(&pkt[..n], MAX_FRAME, &mut buf).unwrap();
+        assert_eq!(got, frame);
+        rs_pcm.extend_from_slice(&buf[..got * ch]);
+
+        if fec && p > 0 {
+            // Recovers packet p-1 from packet p's LBRR data.
+            let got = c_fec
+                .decode_float(&pkt[..n], &mut buf[..frame * ch], true)
+                .unwrap_or_else(|e| panic!("packet {p}: libopus FEC decode failed: {e}"));
+            assert_eq!(got, frame);
+            fec_pcm.extend_from_slice(&buf[..got * ch]);
+        }
+    }
+    let win = sr / 50;
+    let max_lag = (sr * LAG_MS / 1000) as isize;
+    let reference = mid(&input, ch);
+    RustEncoded {
+        normal: window_snrs(&reference, &mid(&pcm, ch), 1, win, frame, max_lag),
+        // fec_pcm[k] is packet k's audio (recovered from packet k+1).
+        lbrr: if fec {
+            window_snrs(&reference, &mid(&fec_pcm, ch), 1, win, frame, max_lag)
+        } else {
+            Vec::new()
+        },
+        agreement: window_snrs(&pcm, &rs_pcm, ch, win, frame, 30),
+    }
+}
+
+/// Floor for opus-rs-encoded audio decoded by libopus, against the input.
+/// SILK is not a waveform-matching codec, so this sits well below the
+/// codec-agreement bar: clean 20 ms packets score 5-8 dB here; a desynced
+/// frame scores around 0 dB or below.
+const INPUT_FLOOR_DB: f64 = 3.0;
+
+/// Part 2a: a 40 ms stereo packet must decode in libopus as well as 20 ms
+/// packets do (the stereo header used to be written for frame 0 only).
+/// opus-rs rejects 60 ms at the encoder (`Invalid frame size`), so 40 ms is
+/// the only multi-frame SILK packet it can produce.
+#[test]
+fn opus_rs_40ms_stereo_decodes_in_libopus() {
+    let base = rust_enc_c_dec(2, 20, false, true);
+    let multi = rust_enc_c_dec(2, 40, false, true);
+    let (base_worst, worst) = (min(&base.normal), min(&multi.normal));
+    println!(
+        "opus-rs enc 40 ms stereo -> libopus dec: worst {worst:.1} dB \
+         (20 ms baseline {base_worst:.1} dB); opus-rs vs libopus {:.1} dB",
+        min(&multi.agreement)
+    );
+    assert!(
+        base_worst > INPUT_FLOOR_DB,
+        "20 ms baseline too weak: {:.1?}",
+        base.normal
+    );
+    assert!(
+        worst > INPUT_FLOOR_DB && worst > base_worst - 3.0,
+        "40 ms stereo: a SILK frame desynced in libopus; per-window SNR: {:.1?}",
+        multi.normal
+    );
+    assert!(
+        min(&multi.agreement) > MATCH_DB,
+        "decoders disagree: {:.1?}",
+        multi.agreement
+    );
+}
+
+/// Part 2b: in-band FEC. The packet must still decode normally (FEC on must
+/// not cost the main frame anything), and libopus must recover each previous
+/// frame from the LBRR section.
+///
+/// VBR, because at CBR the LBRR section never fits the packet budget and is
+/// dropped, which would leave the LBRR path untested. Mono is covered too:
+/// LBRR frames were written with CODE_INDEPENDENTLY_NO_LTP_SCALING while
+/// every decoder reads CODE_INDEPENDENTLY, so each voiced LBRR frame desynced
+/// the main frame after it, regardless of channel count.
+fn check_fec_decodes_in_libopus(ch: usize) {
+    let plain = rust_enc_c_dec(ch, 20, false, false);
+    let fec = rust_enc_c_dec(ch, 20, true, false);
+    let (plain_worst, worst, lbrr_worst) = (min(&plain.normal), min(&fec.normal), min(&fec.lbrr));
+    println!(
+        "opus-rs enc 20 ms {ch}ch + FEC -> libopus: normal {worst:.1} dB \
+         (no-FEC {plain_worst:.1} dB), LBRR {lbrr_worst:.1} dB; opus-rs vs libopus {:.1} dB",
+        min(&fec.agreement)
+    );
+    assert!(
+        worst > INPUT_FLOOR_DB && worst > plain_worst - 1.0,
+        "{ch}ch + FEC: normal decode desynced in libopus; per-window SNR: {:.1?}",
+        fec.normal
+    );
+    assert!(
+        lbrr_worst > LBRR_FLOOR_DB,
+        "{ch}ch + FEC: LBRR missing or desynced in libopus; per-window SNR: {:.1?}",
+        fec.lbrr
+    );
+    assert!(
+        min(&fec.agreement) > MATCH_DB,
+        "decoders disagree: {:.1?}",
+        fec.agreement
+    );
+}
+
+/// LBRR recovery floor. Measured worst windows: 2.8 dB mono, 1.6 dB stereo
+/// (the LBRR copy carries a raised gain); a missing LBRR section decodes to
+/// silence, exactly 0 dB.
+const LBRR_FLOOR_DB: f64 = 0.5;
+
+#[test]
+fn opus_rs_mono_fec_decodes_in_libopus() {
+    check_fec_decodes_in_libopus(1);
+}
+
+#[test]
+fn opus_rs_stereo_fec_decodes_in_libopus() {
+    check_fec_decodes_in_libopus(2);
+}
