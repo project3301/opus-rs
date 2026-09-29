@@ -300,7 +300,8 @@ fn issue_27_3_silk_40ms_resampled_full_decode() {
         // that figure compared 16 kHz input against 48 kHz output sample by
         // sample.) The lag search absorbs a constant offset: opus-rs's mono
         // SILK output runs one internal sample (3 samples at 48 kHz) ahead of
-        // libopus, which delays mono through the stereo sMid buffer.
+        // libopus, because dec_api.rs reads mono from w_silk_buf[0][2..]
+        // where libopus reads from [1] (restsend/opus-rs#34).
         let mut c_pcm = vec![0.0f32; dec_frame];
         let c_n = c_dec.decode_float(&pkt[..n], &mut c_pcm, false).unwrap();
         assert_eq!(c_n, dec_frame);
