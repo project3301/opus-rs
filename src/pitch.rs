@@ -12,7 +12,7 @@ use crate::celt_lpc::{autocorr, lpc};
 pub fn inner_prod(x: &[f32], y: &[f32], n: usize) -> f32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
-        if crate::compat::x86_has_avx() {
+        if crate::compat::x86_has_avx_fma() {
             return inner_prod_avx(x, y, n);
         }
     }
@@ -40,7 +40,7 @@ pub fn inner_prod(x: &[f32], y: &[f32], n: usize) -> f32 {
 pub fn dual_inner_prod(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
-        if crate::compat::x86_has_avx() {
+        if crate::compat::x86_has_avx_fma() {
             return dual_inner_prod_avx(x, y1, y2, n);
         }
     }
@@ -81,7 +81,7 @@ pub fn pitch_xcorr(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitc
     };
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
-        if crate::compat::x86_has_avx() {
+        if crate::compat::x86_has_avx_fma() {
             return pitch_xcorr_avx(x, y, xcorr, len, max_pitch);
         }
     }

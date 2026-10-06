@@ -791,7 +791,7 @@ pub fn pvq_search(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     }
 
     #[cfg(target_arch = "x86_64")]
-    if k > 4 && crate::compat::x86_has_avx2() {
+    if k > 4 && crate::compat::x86_has_avx2_fma() {
         unsafe {
             pvq_search_avx2(x, y, k, n);
         }
@@ -2263,7 +2263,7 @@ pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        if n >= 8 && crate::compat::x86_has_avx2() {
+        if n >= 8 && crate::compat::x86_has_avx2_fma() {
             renormalise_vector_avx2(x, n, gain);
             return;
         }
@@ -2338,7 +2338,7 @@ unsafe fn alg_quant_resynth_neon(y: &[i32], x: &mut [f32], n: usize, gain: f32) 
 fn alg_quant_resynth_scalar(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        if crate::compat::x86_has_avx2() {
+        if crate::compat::x86_has_avx2_fma() {
             alg_quant_resynth_avx2(y, x, n, gain);
             return;
         }

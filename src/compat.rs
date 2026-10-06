@@ -5,7 +5,8 @@
 //!   atomic and inline `UnsafeCell<MaybeUninit<T>>` storage. The value is
 //!   constructed exactly once into the inline storage, so no global allocator is
 //!   required. Replaces `std::sync::LazyLock`.
-//! * [`x86_has_avx`] / [`x86_has_avx2`] — x86 SIMD availability probes. Under the
+//! * [`x86_has_avx`] / [`x86_has_avx2`] / [`x86_has_avx_fma`] / [`x86_has_avx2_fma`]
+//!   — x86 SIMD availability probes. Under the
 //!   `std` feature these use the OS-backed `is_x86_feature_detected!`; without `std`
 //!   they fall back to compile-time `cfg!(target_feature = ...)`.
 
@@ -148,6 +149,33 @@ pub fn x86_has_avx2() -> bool {
 #[allow(dead_code)]
 pub fn x86_has_avx2() -> bool {
     cfg!(target_feature = "avx2")
+}
+
+/// Whether both `avx` and `fma` are usable. Gates kernels compiled with
+/// `#[target_feature(enable = "avx,fma")]`: AVX alone is not enough, since
+/// Sandy Bridge / Ivy Bridge (and some VMs) have AVX without FMA and would fault
+/// with SIGILL on the first `vfmadd`. See [`x86_has_avx`].
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+pub fn x86_has_avx_fma() -> bool {
+    std::arch::is_x86_feature_detected!("avx") && std::arch::is_x86_feature_detected!("fma")
+}
+#[cfg(not(all(feature = "std", target_arch = "x86_64")))]
+#[allow(dead_code)]
+pub fn x86_has_avx_fma() -> bool {
+    cfg!(all(target_feature = "avx", target_feature = "fma"))
+}
+
+/// Whether both `avx2` and `fma` are usable. Gates kernels compiled with
+/// `#[target_feature(enable = "avx2,fma")]`; AVX2 does not architecturally imply
+/// FMA. See [`x86_has_avx_fma`].
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+pub fn x86_has_avx2_fma() -> bool {
+    std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+}
+#[cfg(not(all(feature = "std", target_arch = "x86_64")))]
+#[allow(dead_code)]
+pub fn x86_has_avx2_fma() -> bool {
+    cfg!(all(target_feature = "avx2", target_feature = "fma"))
 }
 
 // ---------------------------------------------------------------------------
@@ -373,5 +401,17 @@ impl Math for f64 {
     }
     fn mul_add(self, a: Self, b: Self) -> Self {
         libm::fma(self, a, b)
+    }
+}
+
+#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fma_probes_require_both_features() {
+        let fma = std::arch::is_x86_feature_detected!("fma");
+        assert_eq!(x86_has_avx_fma(), x86_has_avx() && fma);
+        assert_eq!(x86_has_avx2_fma(), x86_has_avx2() && fma);
     }
 }
