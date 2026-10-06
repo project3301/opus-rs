@@ -116,6 +116,10 @@ pub struct OpusEncoder {
     silk_initialized: bool,
     mode: OpusMode,
     prev_enc_mode: Option<OpusMode>,
+    /// When set, `encode_impl` uses this mode instead of running the
+    /// mode-selection heuristic. Used to keep all sub-frames of a multiframe
+    /// packet in the same mode (libopus `user_forced_mode`).
+    forced_mode: Option<OpusMode>,
 
     variable_hp_smth2_q15: i32,
     hp_mem: FixedVec<i32, OPUS_HP_MEM>,
@@ -431,6 +435,7 @@ impl OpusEncoder {
             packet_loss_perc: 0,
             silk_initialized: false,
             prev_enc_mode: None,
+            forced_mode: None,
             mode: opus_mode,
             variable_hp_smth2_q15,
             hp_mem: FixedVec::from_value(0, channels * 2),
@@ -560,7 +565,9 @@ impl OpusEncoder {
         // Mode selection: match C's opus_encode_native() behavior.
         // C reference auto-selects between SILK_ONLY and CELT_ONLY; Hybrid is
         // produced afterwards by bandwidth overrides (SILK-only + FB/SWB → Hybrid).
-        let mut mode = if self.application == Application::RestrictedLowDelay {
+        let mut mode = if let Some(forced) = self.forced_mode {
+            forced
+        } else if self.application == Application::RestrictedLowDelay {
             OpusMode::CeltOnly
         } else {
             let equiv = compute_equiv_rate(
@@ -592,18 +599,31 @@ impl OpusEncoder {
             }
         };
 
-        let curr_bw = self.bandwidth;
-        if mode == OpusMode::SilkOnly
-            && (curr_bw == Bandwidth::Superwideband || curr_bw == Bandwidth::Fullband)
-        {
-            mode = OpusMode::Hybrid;
+        if self.forced_mode.is_none() {
+            let curr_bw = self.bandwidth;
+            if mode == OpusMode::SilkOnly
+                && (curr_bw == Bandwidth::Superwideband || curr_bw == Bandwidth::Fullband)
+            {
+                mode = OpusMode::Hybrid;
+            }
+            if mode == OpusMode::Hybrid
+                && (curr_bw == Bandwidth::Narrowband
+                    || curr_bw == Bandwidth::Mediumband
+                    || curr_bw == Bandwidth::Wideband)
+            {
+                mode = OpusMode::SilkOnly;
+            }
         }
-        if mode == OpusMode::Hybrid
-            && (curr_bw == Bandwidth::Narrowband
-                || curr_bw == Bandwidth::Mediumband
-                || curr_bw == Bandwidth::Wideband)
+
+        // 40/60 ms frames are only legal as a single Opus frame in SILK-only
+        // mode. CELT and Hybrid cap a frame at 20 ms, so libopus encodes 20 ms
+        // sub-frames and repacketizes them into one code 1/2/3 packet
+        // (opus_encoder.c `encode_multiframe_packet`). (issue #35)
+        if self.forced_mode.is_none()
+            && mode != OpusMode::SilkOnly
+            && frame_size > self.sampling_rate as usize / 50
         {
-            mode = OpusMode::SilkOnly;
+            return self.encode_multiframe(input, frame_size, mode, output);
         }
 
         if mode == OpusMode::CeltOnly {
@@ -622,7 +642,7 @@ impl OpusEncoder {
 
         if mode == OpusMode::SilkOnly {
             match frame_rate {
-                400 | 200 | 100 | 50 | 25 => {}
+                400 | 200 | 100 | 50 | 25 | 16 => {}
                 _ => return Err("Unsupported frame size for SILK-only mode"),
             }
         }
@@ -753,13 +773,13 @@ impl OpusEncoder {
             let silk_input: &[i16] = if mode == OpusMode::SilkOnly && self.sampling_rate > 16000 {
                 if self.sampling_rate == 48000 {
                     let stage1_size = frame_size / 2;
-                    // 48 kHz SILK-only supports up to 40 ms frames (frame_rate 25):
-                    // 1920 API samples -> 960 stage-1 samples at 24 kHz. Guard the
-                    // stack buffer instead of panicking on out-of-range lengths.
-                    if stage1_size > 960 {
+                    // 48 kHz SILK-only supports up to 60 ms frames: 2880 API
+                    // samples -> 1440 stage-1 samples at 24 kHz. Guard the stack
+                    // buffer instead of panicking on out-of-range lengths.
+                    if stage1_size > 1440 {
                         return Err("Invalid frame size for SILK mode");
                     }
-                    let mut stage1_buf = [0i16; 960];
+                    let mut stage1_buf = [0i16; 1440];
                     silk_resampler_down2(
                         &mut self.down2_state_first,
                         &mut stage1_buf[..stage1_size],
@@ -1132,6 +1152,106 @@ impl OpusEncoder {
         self.prev_enc_mode = Some(mode);
         Ok(payload_len + 1)
     }
+
+    /// Repacketize 40/60 ms CELT/Hybrid input as 20 ms sub-frames in one code
+    /// 1/2/3 Opus packet (libopus `encode_multiframe_packet`). Every sub-frame
+    /// is forced to `mode` so the packet carries a single config.
+    fn encode_multiframe(
+        &mut self,
+        input: PcmInput<'_>,
+        frame_size: usize,
+        mode: OpusMode,
+        output: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        const MAX_SUB: usize = 3; // up to 60 ms of 20 ms frames
+        let ch = self.channels;
+        let enc_frame = (self.sampling_rate / 50) as usize; // 20 ms
+        if enc_frame == 0 || !frame_size.is_multiple_of(enc_frame) {
+            return Err("Invalid multi-frame size");
+        }
+        let nb = frame_size / enc_frame;
+        if !(2..=MAX_SUB).contains(&nb) {
+            return Err("Unsupported multi-frame size");
+        }
+
+        // RFC 6716 size field: one byte below 252, else two.
+        fn put_size(out: &mut [u8], pos: &mut usize, len: usize) -> Result<(), &'static str> {
+            if len < 252 {
+                if *pos >= out.len() {
+                    return Err("Output buffer too small");
+                }
+                out[*pos] = len as u8;
+                *pos += 1;
+            } else {
+                if *pos + 1 >= out.len() {
+                    return Err("Output buffer too small");
+                }
+                let first = 252 + (len & 3);
+                out[*pos] = first as u8;
+                out[*pos + 1] = ((len - first) >> 2) as u8;
+                *pos += 2;
+            }
+            Ok(())
+        }
+
+        let mut sub = [[0u8; 1276]; MAX_SUB];
+        let mut lens = [0usize; MAX_SUB];
+        self.forced_mode = Some(mode);
+        let enc_res = (|| -> Result<(), &'static str> {
+            for i in 0..nb {
+                let start = i * enc_frame * ch;
+                let end = start + enc_frame * ch;
+                let sub_input = match input {
+                    PcmInput::F32(s) => PcmInput::F32(&s[start..end]),
+                    PcmInput::I16(s) => PcmInput::I16(&s[start..end]),
+                };
+                let n = self.encode_impl(sub_input, enc_frame, &mut sub[i])?;
+                if n == 0 {
+                    return Err("Empty sub-frame");
+                }
+                lens[i] = n - 1;
+            }
+            Ok(())
+        })();
+        self.forced_mode = None;
+        enc_res?;
+
+        let toc = sub[0][0] & 0xFC;
+        let mut pos = 0usize;
+        let push =
+            |out: &mut [u8], pos: &mut usize, byte: u8| -> Result<(), &'static str> {
+                if *pos >= out.len() {
+                    return Err("Output buffer too small");
+                }
+                out[*pos] = byte;
+                *pos += 1;
+                Ok(())
+            };
+        // Use explicit per-frame lengths (code 2 / code 3 VBR) for every
+        // sub-frame packet: it is always valid, and avoids the code-3 CBR
+        // assumption that all frames are byte-identical in size.
+        if nb == 2 {
+            push(output, &mut pos, toc | 0x02)?;
+            put_size(output, &mut pos, lens[0])?;
+        } else {
+            push(output, &mut pos, toc | 0x03)?;
+            push(output, &mut pos, nb as u8 | 0x80)?;
+            for i in 0..nb - 1 {
+                put_size(output, &mut pos, lens[i])?;
+            }
+        }
+
+        for i in 0..nb {
+            let payload = &sub[i][1..1 + lens[i]];
+            if pos + payload.len() > output.len() {
+                return Err("Output buffer too small");
+            }
+            output[pos..pos + payload.len()].copy_from_slice(payload);
+            pos += payload.len();
+        }
+        self.prev_enc_mode = Some(mode);
+        Ok(pos)
+    }
 }
 
 pub struct OpusDecoder {
@@ -1374,28 +1494,31 @@ impl OpusDecoder {
                     // for VBR and CBR (no length prefix is present).
                     payloads.push(payload);
                 } else if vbr {
-                    // VBR (V=1): per-frame lengths for all frames except the last,
-                    // which takes the remaining bytes (RFC 6716 §3.2.1).
+                    // VBR (V=1): the per-frame length fields for all frames
+                    // except the last come first, then all frame payloads
+                    // (RFC 6716 §3.2.1; libopus `opus_packet_parse_impl`).
+                    // Interleaving length and data — as this used to — parsed
+                    // any libopus code-3 VBR packet wrong.
                     let mut cursor = 0usize;
-                    for i in 0..frame_count {
-                        if i + 1 < frame_count {
-                            if cursor >= payload.len() {
-                                return Err("Code 3: unexpected end in VBR header");
-                            }
-                            let (frame_len, header_bytes) = parse_frame_size(&payload[cursor..])?;
-                            cursor += header_bytes;
-                            if cursor + frame_len > payload.len() {
-                                return Err("Code 3: frame length exceeds packet");
-                            }
-                            payloads.push(&payload[cursor..cursor + frame_len]);
-                            cursor += frame_len;
-                        } else {
-                            // Last frame: remaining bytes, no length prefix.
-                            if cursor > payload.len() {
-                                return Err("Code 3: no data for last frame");
-                            }
-                            payloads.push(&payload[cursor..]);
+                    let mut frame_bytes = 0usize;
+                    let mut sizes = [0usize; OPUS_MAX_PACKET_FRAMES];
+                    for i in 0..frame_count - 1 {
+                        if cursor >= payload.len() {
+                            return Err("Code 3: unexpected end in VBR header");
                         }
+                        let (frame_len, header_bytes) = parse_frame_size(&payload[cursor..])?;
+                        cursor += header_bytes;
+                        sizes[i] = frame_len;
+                        frame_bytes += frame_len;
+                    }
+                    if frame_bytes > payload.len() - cursor {
+                        return Err("Code 3: frame length exceeds packet");
+                    }
+                    sizes[frame_count - 1] = payload.len() - cursor - frame_bytes;
+                    let mut data_pos = cursor;
+                    for i in 0..frame_count {
+                        payloads.push(&payload[data_pos..data_pos + sizes[i]]);
+                        data_pos += sizes[i];
                     }
                 } else {
                     // CBR (V=0): remaining bytes are split equally into M frames
@@ -1998,10 +2121,25 @@ impl OpusDecoder {
 
 fn frame_rate_from_params(sampling_rate: i32, frame_size: usize) -> Option<i32> {
     let frame_size = frame_size as i32;
-    if frame_size == 0 || sampling_rate % frame_size != 0 {
+    if frame_size <= 0 {
         return None;
     }
-    Some(sampling_rate / frame_size)
+    // libopus `frame_size_select`: a frame is 2.5, 5, 10, 20, 40 or 60 ms.
+    // Validating by duration (not by `sampling_rate % frame_size == 0`) is what
+    // lets 60 ms through: its rate is 16.67 frames/s, so the old divisibility
+    // test rejected it before encoding could start (issue #35). Longer frames
+    // (>60 ms) are handled by the caller's multiframe path.
+    let fs = sampling_rate;
+    let valid = frame_size == fs / 400
+        || frame_size == fs / 200
+        || frame_size == fs / 100
+        || frame_size == fs / 50
+        || frame_size == fs / 25
+        || 50 * frame_size == 3 * fs;
+    if !valid {
+        return None;
+    }
+    Some(fs / frame_size)
 }
 
 fn gen_toc(mode: OpusMode, frame_rate: i32, bandwidth: Bandwidth, channels: usize) -> u8 {

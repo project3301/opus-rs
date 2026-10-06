@@ -139,8 +139,16 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
   internal-rate sample early, and equal API/SILK-internal rates bypassed
   `silk_resampler`, dropping its `inputDelay`. Mono SILK now matches libopus at
   lag 0 at 16 kHz and 48 kHz.
+- **Fix: 40/60 ms frames (issue #35).** Frame sizes were validated by
+  `sampling_rate % frame_size == 0`, which rejected 60 ms (16.67 frames/s)
+  before encoding. Validation is now duration-based. SILK-only carries a
+  60 ms frame directly (3 internal SILK frames); CELT and Hybrid, which cap a
+  frame at 20 ms, repacketize 20 ms sub-frames into one code 1/2/3 packet, as
+  libopus does. This also fixes the code-3 VBR packet parser, which read frame
+  lengths and frame data interleaved instead of all lengths first (libopus
+  layout) — a latent bug that only surfaced once the encoder emitted code 3.
 - **Tests:** new libopus-oracle suites for SILK multi-frame/FEC (#27),
-  frame-loss concealment (#15) and mono alignment (#34).
+  frame-loss concealment (#15), mono alignment (#34) and 40/60 ms frames (#35).
 
 ### 0.1.34
 
