@@ -299,9 +299,11 @@ impl SilkDecoder {
         }
 
         // Copy planar output: ch0 at output[0..fl], ch1 at output[fl..2*fl].
-        // For stereo, MS_to_LR outputs at [1..1+fl] (with overlap compensation).
-        // For mono, decoded data is at [2..2+fl] — use it directly (no offset)
-        // to match the pre-stereo-rewrite behaviour.
+        // libopus (`silk/dec_API.c`) resamples mono and stereo alike from
+        // `samplesOut1_tmp[n][1]`: samples [0]/[1] are `sMid`, written just
+        // above for mono (and by MS_to_LR for stereo), so index 1 is the
+        // one-sample-delayed position. Mono used to read from [2..2+fl], which
+        // made it one internal-rate sample early versus libopus (issue #34).
         let fl = n_samples_out as usize;
         if n_channels == 2 {
             if output.len() < 2 * fl {
@@ -313,7 +315,7 @@ impl SilkDecoder {
             if output.len() < fl {
                 return -1;
             }
-            output[..fl].copy_from_slice(&self.w_silk_buf[0][2..2 + fl]);
+            output[..fl].copy_from_slice(&self.w_silk_buf[0][1..1 + fl]);
         }
 
         self.prev_decode_only_middle = decode_only_middle;

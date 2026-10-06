@@ -1532,8 +1532,8 @@ impl OpusDecoder {
                     Bandwidth::Wideband => 16000,
                     _ => 16000,
                 };
-                if self.sampling_rate != internal_sample_rate
-                    && internal_sample_rate != self.prev_internal_rate
+                if internal_sample_rate != self.prev_internal_rate
+                    || !self.silk_resampler.is_initialized()
                 {
                     self.silk_resampler
                         .init(internal_sample_rate, self.sampling_rate);
@@ -1612,8 +1612,8 @@ impl OpusDecoder {
                 let internal_sample_rate = 16000;
                 let celt_end_band = self.celt_end_band_from_toc(toc);
 
-                if self.sampling_rate != internal_sample_rate
-                    && internal_sample_rate != self.prev_internal_rate
+                if internal_sample_rate != self.prev_internal_rate
+                    || !self.silk_resampler.is_initialized()
                 {
                     self.silk_resampler
                         .init(internal_sample_rate, self.sampling_rate);
@@ -1927,57 +1927,49 @@ impl OpusDecoder {
 
             // SILK decoder outputs planar for THIS frame:
             // ch0 at [0..fl], ch1 at [fl..2*fl].
-            if self.sampling_rate == internal_rate {
-                let frames = decoded_samples.min(internal_frame_size - frame_pos);
-                for i in 0..frames {
-                    for ch in 0..self.channels {
-                        let src = if ch == 0 { i } else { decoded_samples + i };
-                        let v = self.w_pcm_i16[src] as f32 / 32768.0;
-                        let idx = (frame_pos + i) * self.channels + ch;
-                        if idx < out_len {
-                            self.w_silk_out[idx] = v;
-                        }
-                    }
-                }
-            } else {
-                let resampled_len =
-                    decoded_samples * self.sampling_rate as usize / internal_rate as usize;
-                let api_pos = frame_pos * self.sampling_rate as usize / internal_rate as usize;
-                let copy_len = resampled_len.min(api_len - api_pos);
-                debug_assert!(resampled_len * self.channels <= self.w_pcm_resampled.len());
-                // Resample channel 0.
-                {
-                    let (res, inp, out) = (
-                        &mut self.silk_resampler,
-                        state_ref(&self.w_pcm_i16),
-                        state_mut(&mut self.w_pcm_resampled),
-                    );
-                    res.process(
-                        &mut out[..resampled_len],
-                        &inp[..decoded_samples],
-                        decoded_samples as i32,
-                    );
-                }
-                // Resample channel 1 (stereo only).
-                if self.channels == 2 {
-                    let (res, inp, out) = (
-                        &mut self.silk_resampler_2,
-                        state_ref(&self.w_pcm_i16),
-                        state_mut(&mut self.w_pcm_resampled),
-                    );
-                    res.process(
-                        &mut out[resampled_len..2 * resampled_len],
-                        &inp[decoded_samples..2 * decoded_samples],
-                        decoded_samples as i32,
-                    );
-                }
-                for i in 0..copy_len {
-                    for ch in 0..self.channels {
-                        let v = self.w_pcm_resampled[ch * resampled_len + i] as f32 / 32768.0;
-                        let idx = (api_pos + i) * self.channels + ch;
-                        if idx < out_len {
-                            self.w_silk_out[idx] = v;
-                        }
+            //
+            // libopus always runs `silk_resampler`, even when the API and SILK
+            // internal rates are equal: the Copy path still carries the
+            // resampler's `inputDelay` (12 samples at 16k, 4 at 8k). Bypassing
+            // it made equal-rate SILK output early versus libopus (and versus
+            // opus-rs's own resampled paths).
+            let resampled_len =
+                decoded_samples * self.sampling_rate as usize / internal_rate as usize;
+            let api_pos = frame_pos * self.sampling_rate as usize / internal_rate as usize;
+            let copy_len = resampled_len.min(api_len - api_pos);
+            debug_assert!(resampled_len * self.channels <= self.w_pcm_resampled.len());
+            // Resample channel 0.
+            {
+                let (res, inp, out) = (
+                    &mut self.silk_resampler,
+                    state_ref(&self.w_pcm_i16),
+                    state_mut(&mut self.w_pcm_resampled),
+                );
+                res.process(
+                    &mut out[..resampled_len],
+                    &inp[..decoded_samples],
+                    decoded_samples as i32,
+                );
+            }
+            // Resample channel 1 (stereo only).
+            if self.channels == 2 {
+                let (res, inp, out) = (
+                    &mut self.silk_resampler_2,
+                    state_ref(&self.w_pcm_i16),
+                    state_mut(&mut self.w_pcm_resampled),
+                );
+                res.process(
+                    &mut out[resampled_len..2 * resampled_len],
+                    &inp[decoded_samples..2 * decoded_samples],
+                    decoded_samples as i32,
+                );
+            }
+            for i in 0..copy_len {
+                for ch in 0..self.channels {
+                    let v = self.w_pcm_resampled[ch * resampled_len + i] as f32 / 32768.0;
+                    let idx = (api_pos + i) * self.channels + ch;
+                    if idx < out_len {
+                        self.w_silk_out[idx] = v;
                     }
                 }
             }
