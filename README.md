@@ -116,6 +116,32 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
 
 ## Release Notes
 
+### 0.1.35
+
+- **Fix: SIGILL on AVX-without-FMA CPUs (issue #30, PR #31).** Nine kernels
+  compiled with `#[target_feature(enable = "avx,fma")]` / `"avx2,fma"` were
+  dispatched after checking only AVX/AVX2. New `compat::x86_has_avx_fma()` /
+  `x86_has_avx2_fma()` probes gate them, so Sandy/Ivy Bridge and VMs that mask
+  FMA no longer fault on the first `vfmadd`.
+- **Fix: frame-loss concealment (issue #15, PR #32).** Packets of 0 or 1 bytes
+  were decoded using the placeholder byte's ToC, which switched the decoder's
+  mode/bandwidth/SILK rate and could panic in the resampler. Losses now conceal
+  in the previous mode, as libopus does; an empty packet conceals `frame_size`
+  samples instead of erroring, and a mono marker no longer errors on a stereo
+  decoder.
+- **Fix: in-band FEC LBRR desync (issue #27, PR #33).** LBRR frames were coded
+  with `CODE_INDEPENDENTLY_NO_LTP_SCALING` while every decoder reads
+  `CODE_INDEPENDENTLY`, so a voiced LBRR frame desynced the main frame that
+  followed it. The LBRR gain bump now raises only index 0 of independently
+  coded frames, as libopus does.
+- **Fix: SILK decoder alignment with libopus (issue #34).** Mono SILK output
+  read from `w_silk_buf[0][2..]` instead of libopus's `[1..]`, running one
+  internal-rate sample early, and equal API/SILK-internal rates bypassed
+  `silk_resampler`, dropping its `inputDelay`. Mono SILK now matches libopus at
+  lag 0 at 16 kHz and 48 kHz.
+- **Tests:** new libopus-oracle suites for SILK multi-frame/FEC (#27),
+  frame-loss concealment (#15) and mono alignment (#34).
+
 ### 0.1.34
 
 - **New: `OpusEncoder::encode_i16()` — native PCM16 entry point (issue #28).**
