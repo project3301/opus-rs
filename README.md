@@ -116,6 +116,21 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
 
 ## Release Notes
 
+### Unreleased
+
+- **Fix: CELT flagged transients on steady pitched input (issue #38).** The
+  encoder ran `tone_detect` and `transient_analysis` on a buffer whose
+  overlap head was the previous frame's *prefiltered* signal while the body
+  was unfiltered; libopus 1.6 analyses the unfiltered `prefilter_mem` tail
+  (celt_encoder.c:2017). Wherever the comb filter was active, the step at the
+  head read as a transient: on the issue's chirp, 30 of 65 frames were coded
+  with short blocks at every bitrate (libopus: only the onset frame). With
+  bits to spare this was inaudible, but 48 kHz `Audio` at 20-24 kbps
+  (CELT-only) lost its first ~200 ms (correlation 0.56-0.66); it is now lag 0
+  and correlation 1.00 from the first window, like libopus's CELT.
+  `prefilter_mem` is also kept current while the comb filter is off (stereo,
+  hybrid, complexity < 5), as libopus's always-run `run_prefilter` does.
+
 ### 0.1.36
 
 - **Fix: in-band FEC emitted no LBRR at CBR (issue #36).** The LBRR payload

@@ -693,6 +693,36 @@ impl OpusEncoder {
             }
         }
 
+        // Per-frame packet budget (C computes this before the mode-dependent
+        // encode; the starved-budget rules below need it too).
+        let target_bits =
+            (self.bitrate_bps as i64 * frame_size as i64 / self.sampling_rate as i64) as i32;
+        let cbr_bytes = ((target_bits + 4) / 8) as usize;
+        let max_data_bytes = output.len();
+
+        // C parity (opus_encoder.c): the nominal-size cap applies in CBR mode
+        // only. In VBR mode the CELT-internal bound (vbr_rate/reservoir) decides
+        // the per-frame size, allowing overshoot (borrowing) and undershoot.
+        // Capping VBR at nominal defeats the reservoir and starves complex frames.
+        let mut n_bytes = if self.use_cbr {
+            cbr_bytes
+                .min(max_data_bytes)
+                .clamp(1, OPUS_MAX_PACKET_BYTES)
+        } else {
+            max_data_bytes.clamp(1, OPUS_MAX_PACKET_BYTES)
+        };
+
+        // C opus_encoder.c:1525-1527: a budget representing less than 6 kb/s
+        // (9 kb/s for frames longer than 20 ms) cannot carry SILK — libopus
+        // switches to CELT-only mode, which codes it as a small valid packet
+        // instead of a PLC placeholder (issue #46).
+        let tiny_budget_rate: i64 = if frame_rate > 50 { 9000 } else { 6000 };
+        if ((n_bytes as i64) * 8 * (self.sampling_rate as i64))
+            < (tiny_budget_rate * (frame_size as i64))
+        {
+            mode = OpusMode::CeltOnly;
+        }
+
         // 40/60 ms frames are only legal as a single Opus frame in SILK-only
         // mode. CELT and Hybrid cap a frame at 20 ms, so libopus encodes 20 ms
         // sub-frames and repacketizes them into one code 1/2/3 packet
@@ -760,22 +790,84 @@ impl OpusEncoder {
         let toc = gen_toc(mode, frame_rate, frame_bandwidth, self.channels);
         output[0] = toc;
 
-        let target_bits =
-            (self.bitrate_bps as i64 * frame_size as i64 / self.sampling_rate as i64) as i32;
-        let cbr_bytes = ((target_bits + 4) / 8) as usize;
-        let max_data_bytes = output.len();
+        // C opus_encoder.c:1226-1243: a budget too small to code anything
+        // useful produces a TOC-only "PLC" packet — decoders conceal it as a
+        // loss. Encoding into 0-2 bytes would otherwise overflow the range
+        // coder (issue #45). Under CBR the packet is padded to the nominal
+        // size, exactly like libopus's opus_packet_pad.
+        let sub_3_bytes_per_frame =
+            (self.bitrate_bps as i64) < 3 * frame_rate as i64 * 8;
+        let tiny_long_frame =
+            frame_rate < 50
+                && (n_bytes * (frame_rate as usize) < 300 || self.bitrate_bps < 2400);
+        if n_bytes < 3 || sub_3_bytes_per_frame || tiny_long_frame {
+            let mut toc_mode = mode;
+            let mut packet_code = 0u8;
+            let mut num_multiframes = 0u8;
+            let mut frame_rate_adj = frame_rate;
+            if frame_rate > 100 {
+                toc_mode = OpusMode::CeltOnly;
+            }
+            // 40 ms -> 2 x 20 ms in CELT/hybrid mode.
+            if frame_rate == 25 && toc_mode != OpusMode::SilkOnly {
+                frame_rate_adj = 50;
+                packet_code = 1;
+            }
+            // >= 60 ms frames: 1 x 60 ms, or 2 x 40 ms / 2 x 60 ms multiframes.
+            if frame_rate <= 16 {
+                if n_bytes == 1 || (toc_mode == OpusMode::SilkOnly && frame_rate != 10) {
+                    toc_mode = OpusMode::SilkOnly;
+                    packet_code = if frame_rate <= 12 { 1 } else { 0 };
+                    frame_rate_adj = if frame_rate == 12 { 25 } else { 16 };
+                } else {
+                    num_multiframes = (50 / frame_rate) as u8;
+                    frame_rate_adj = 50;
+                    packet_code = 3;
+                }
+            }
+            let mut plc_bw = frame_bandwidth;
+            if toc_mode == OpusMode::SilkOnly && bandwidth_fec_index(plc_bw) > 2 {
+                // SilkOnly is wideband at most (C: bw > OPUS_BANDWIDTH_WIDEBAND).
+                plc_bw = Bandwidth::Wideband;
+            }
+            output[0] = gen_toc(toc_mode, frame_rate_adj, plc_bw, self.channels) | packet_code;
+            let mut ret = if packet_code <= 1 { 1 } else { 2 };
+            if packet_code == 3 {
+                output[1] = num_multiframes;
+            }
+            if self.use_cbr {
+                let target_total = n_bytes.min(output.len());
+                if target_total > ret {
+                    // opus_packet_pad of the TOC-only packet: code 3 with
+                    // `m` empty frames and zero padding.
+                    let m: usize = if packet_code == 3 {
+                        num_multiframes as usize
+                    } else if packet_code == 1 {
+                        2
+                    } else {
+                        1
+                    };
+                    output[0] = (output[0] & 0xFC) | 0x03;
+                    output[1] = 0x40 | m as u8; // padding present, CBR, m frames
+                    let pad_amount = target_total - 2;
+                    let nb_255s = (pad_amount - 1) / 255;
+                    let mut ptr = 2;
+                    for _ in 0..nb_255s {
+                        output[ptr] = 255;
+                        ptr += 1;
+                    }
+                    output[ptr] = (pad_amount - 255 * nb_255s - 1) as u8;
+                    ptr += 1;
+                    for b in &mut output[ptr..target_total] {
+                        *b = 0;
+                    }
+                    ret = target_total;
+                }
+            }
+            // C leaves st->prev_mode untouched on this path.
+            return Ok(ret);
+        }
 
-        // C parity (opus_encoder.c): the nominal-size cap applies in CBR mode
-        // only. In VBR mode the CELT-internal bound (vbr_rate/reservoir) decides
-        // the per-frame size, allowing overshoot (borrowing) and undershoot.
-        // Capping VBR at nominal defeats the reservoir and starves complex frames.
-        let mut n_bytes = if self.use_cbr {
-            cbr_bytes
-                .min(max_data_bytes)
-                .clamp(1, OPUS_MAX_PACKET_BYTES)
-        } else {
-            max_data_bytes.clamp(1, OPUS_MAX_PACKET_BYTES)
-        };
         let init_rc_size = n_bytes - 1;
         self.rc.reset_for_encode(init_rc_size as u32);
 

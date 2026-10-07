@@ -1566,44 +1566,33 @@ fn run_prefilter(
                     &pre[c * pre_size + max_period..c * pre_size + max_period + frame_size],
                 );
         }
-
-        for c in 0..channels {
-            if frame_size >= max_period {
-                prefilter_mem[c * max_period..(c + 1) * max_period].copy_from_slice(
-                    &pre[c * pre_size + frame_size..c * pre_size + frame_size + max_period],
-                );
-            } else {
-                let shift = max_period - frame_size;
-                prefilter_mem.copy_within(
-                    c * max_period + frame_size..(c + 1) * max_period,
-                    c * max_period,
-                );
-                prefilter_mem[c * max_period + shift..(c + 1) * max_period].copy_from_slice(
-                    &pre[c * pre_size + max_period..c * pre_size + max_period + frame_size],
-                );
-            }
-        }
-        return (false, 0.0, pitch_index);
     }
 
     for c in 0..channels {
-        if frame_size >= max_period {
-            prefilter_mem[c * max_period..(c + 1) * max_period].copy_from_slice(
-                &pre[c * pre_size + frame_size..c * pre_size + frame_size + max_period],
-            );
-        } else {
-            let shift = max_period - frame_size;
-            prefilter_mem.copy_within(
-                c * max_period + frame_size..(c + 1) * max_period,
-                c * max_period,
-            );
-            prefilter_mem[c * max_period + shift..(c + 1) * max_period].copy_from_slice(
-                &pre[c * pre_size + max_period..c * pre_size + max_period + frame_size],
-            );
-        }
+        push_prefilter_history(
+            &mut prefilter_mem[c * max_period..(c + 1) * max_period],
+            &pre[c * pre_size + max_period..c * pre_size + pre_size],
+        );
     }
 
-    (pf_on, gain1, pitch_index)
+    if cancel_pitch {
+        (false, 0.0, pitch_index)
+    } else {
+        (pf_on, gain1, pitch_index)
+    }
+}
+
+/// Append one frame of pre-emphasized, unfiltered input to a channel's
+/// `prefilter_mem` history (libopus `run_prefilter`, which runs every frame
+/// whether or not the comb filter is enabled).
+fn push_prefilter_history(mem: &mut [f32], frame: &[f32]) {
+    let (n, max_period) = (frame.len(), mem.len());
+    if n >= max_period {
+        mem.copy_from_slice(&frame[n - max_period..]);
+    } else {
+        mem.copy_within(n.., 0);
+        mem[max_period - n..].copy_from_slice(frame);
+    }
 }
 
 /// Padding appended to `w_x` to absorb any SIMD over-shoot past the last band.
@@ -2348,6 +2337,18 @@ impl CeltEncoder {
             );
         }
 
+        // C 2017: tone and transient analysis see the *unfiltered* history in
+        // the overlap head (the `prefilter_mem` tail). `in_buf`'s head is the
+        // previous frame's prefiltered overlap, so analysing it as-is puts a
+        // step between head and body wherever the comb filter was active,
+        // which reads as a transient on steady pitched input (issue #38).
+        let max_period = COMBFILTER_MAXPERIOD;
+        for c in 0..channels {
+            in_buf[c * buf_stride..c * buf_stride + overlap].copy_from_slice(
+                &self.prefilter_mem[(c + 1) * max_period - overlap..(c + 1) * max_period],
+            );
+        }
+
         // Tone detection (C 2022): use channel-contiguous in_buf with N+overlap, float path
         let (tone_freq, mut toneishness) = tone_detect(&*in_buf, channels, buf_stride, mode.fs);
         let mut tf_estimate = 0.0f32;
@@ -2371,6 +2372,14 @@ impl CeltEncoder {
         } else {
             false
         };
+        // Put the prefiltered overlap back for the prefilter and the MDCT
+        // (C run_prefilter: `OPUS_COPY(in, st->in_mem, overlap)`).
+        let in_mem_start = syn_mem_size - frame_size - overlap;
+        for c in 0..channels {
+            let src = c * syn_mem_size + in_mem_start;
+            in_buf[c * buf_stride..c * buf_stride + overlap]
+                .copy_from_slice(&self.syn_mem[src..src + overlap]);
+        }
         // Clamp toneishness as in C 2034: toneishness = min(toneishness, 1 - tf_estimate)
         // For float, tf_estimate is log-domain; clamp to [0,1]
         toneishness = toneishness.min((1.0 - tf_estimate).clamp(0.0, 1.0));
@@ -2414,6 +2423,16 @@ impl CeltEncoder {
                 self.complexity,
             )
         } else {
+            // libopus runs run_prefilter (disabled) every frame, so its
+            // history stays current for the analysis head above and for the
+            // pitch search when the comb filter turns back on.
+            for c in 0..channels {
+                let body = c * buf_stride + overlap;
+                push_prefilter_history(
+                    &mut self.prefilter_mem[c * max_period..(c + 1) * max_period],
+                    &in_buf[body..body + frame_size],
+                );
+            }
             (false, 0.0f32, COMBFILTER_MINPERIOD)
         };
 
