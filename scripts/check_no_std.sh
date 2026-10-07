@@ -29,4 +29,9 @@ done
 echo ":: building opus-rs (no_std + libm) for host"
 cargo build --no-default-features --features libm || fail=1
 
+# Host no_std test run. Without the `heap` feature the codec structs are
+# ~250 KB inline objects, so the test threads need a big stack.
+echo ":: testing opus-rs (no_std + libm) for host"
+RUST_MIN_STACK=${RUST_MIN_STACK:-33554432} cargo test --no-default-features --features libm || fail=1
+
 exit $fail

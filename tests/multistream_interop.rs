@@ -1,6 +1,9 @@
 //! Differential tests: compare `MultistreamDecoder` against a real libopus
 //! decode of a mapping-family-1 (5.1/7.1) Ogg-Opus file.
 //!
+//! The `multistream` module is `std`-gated, so this whole test crate is
+//! skipped in `no_std` builds.
+#![cfg(feature = "std")]
 //! Requires, per case, in tmp/opus_ref/ (relative to the crate root — run `cargo test` from there):
 //!   `<name>.pkts` — raw container packets, length-prefixed u16 LE, fed
 //!                   whole (don't pre-split by stream).

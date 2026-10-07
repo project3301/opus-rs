@@ -116,6 +116,37 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
 
 ## Release Notes
 
+### 0.1.36
+
+- **Fix: in-band FEC emitted no LBRR at CBR (issue #36).** The LBRR payload
+  reused the main frame's quantized pulses with only the first gain index
+  raised, so it cost as many bits as the main frame and never fit a CBR
+  packet. `silk_LBRR_encode` is now ported faithfully: the excitation is
+  re-quantized through the noise-shaping quantizer at the raised LBRR gain
+  with its own NSQ state and gain chain, gated on speech activity, with
+  `silk_setup_LBRR` (gain increase 7, then `max(7 − 0.2·loss, 2)`) and
+  opus_encoder.c's `decide_fec` (rate thresholds + hysteresis + bandwidth
+  reduction). CBR mono now recovers the previous packet through libopus
+  `decode_fec` at 3.8 dB median (previously 0.0 dB: no LBRR at all).
+- **Fix: 48 kHz SILK/hybrid encoder delay and startup (issue #38).** The
+  encoder input was resampled with the stateless `down2`/`down2_3` decimators
+  plus an internal-rate delay buffer, lagging libopus's pre-skip by up to 17
+  samples. The encoder now runs the libopus `silk_resampler` (encoder
+  direction: `delay_matrix_enc` + private down-FIR, ported with the
+  `silk_Resampler_*_COEFS` tables) on the API-rate input, and prefills the
+  SILK encoder on CELT→SILK restarts. Measured with the issue's harness:
+  Voip 32 kbps lag −5..−2 (libopus's own encoder: identical), Audio 24 kbps
+  startup correlation 0.56 → ≥ 0.77.
+- **Fix: panics found by fuzzing.** 2.5 ms CELT frames aborted in the
+  encoder's lm search (off-by-one: lm=0 was excluded from the valid set);
+  2.5/5 ms frames reached the SILK encoder, whose VAD band split is only
+  valid for ≥ 10 ms frames — SILK-only now rejects sub-10 ms frame sizes
+  (they are CELT-only durations in libopus) and the VAD bails out on
+  non-multiple-of-8 lengths.
+- **no_std:** the crate builds and the full test suite runs with
+  `--no-default-features --features libm` (`RUST_MIN_STACK=33554432`, see
+  `scripts/check_no_std.sh`). 13 fuzz targets run clean.
+
 ### 0.1.35
 
 - **Fix: SIGILL on AVX-without-FMA CPUs (issue #30, PR #31).** Nine kernels

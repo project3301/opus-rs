@@ -69,6 +69,14 @@ pub fn silk_vad_get_sa_q8(ps_enc: &mut SilkEncoderState, p_in: &[i16], _n_in: us
 
     let frame_length = p_in.len();
 
+    // libopus only ever calls the VAD with whole SILK frames (10/20/40/60 ms),
+    // so frame_length is always a multiple of 8 — the three-stage band split
+    // below relies on that. Anything else is an encoder-side misuse; bail out
+    // instead of splitting a short tail (fuzz hardening).
+    if frame_length < 8 * fs_khz || frame_length % 8 != 0 {
+        return 0;
+    }
+
     let decimated_framelength1 = frame_length >> 1;
     let decimated_framelength2 = frame_length >> 2;
     let decimated_framelength = frame_length >> 3;

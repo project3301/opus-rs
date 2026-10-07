@@ -2290,7 +2290,7 @@ impl CeltEncoder {
         // (or worse, silently mis-encodes). Fail fast with a clear message;
         // OpusEncoder::encode() validates this before reaching CELT.
         assert!(
-            (1..=mode.max_lm + 1).any(|lm| mode.short_mdct_size << lm == frame_size),
+            (0..=mode.max_lm).any(|lm| mode.short_mdct_size << lm == frame_size),
             "CeltEncoder: invalid frame_size {} (valid: {}..={} kHz multiples of {})",
             frame_size,
             mode.short_mdct_size,

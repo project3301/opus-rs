@@ -749,7 +749,10 @@ impl OpusEncoder {
 
         if mode == OpusMode::SilkOnly {
             match frame_rate {
-                400 | 200 | 100 | 50 | 25 | 16 => {}
+                100 | 50 | 25 | 16 => {}
+                // 2.5/5 ms are CELT-only durations: SILK frames are 10 ms or
+                // longer (libopus), and sub-10 ms frames break the SILK
+                // analysis geometry (e.g. the VAD band split at 12 kHz).
                 _ => return Err("Unsupported frame size for SILK-only mode"),
             }
         }
@@ -856,7 +859,12 @@ impl OpusEncoder {
                 let f2_5 = self.sampling_rate / 400;
                 let eb = self.encoder_buffer;
                 let offset = eb - self.delay_compensation.min(eb) - f2_5 as usize;
-                let mut pre = vec![0i16; eb];
+                // Stack-fixed: encoder_buffer = Fs/100 <= 480, and the
+                // resampled prefill is at most the same length (Copy at equal
+                // rates). No allocation: this crate is heap-free without the
+                // `heap` feature.
+                let mut pre = [0i16; 480];
+                let pre = &mut pre[..eb];
                 if offset < eb {
                     for i in offset..eb {
                         let fade = (((i - offset) as f32) / f2_5 as f32).min(1.0);
@@ -869,13 +877,11 @@ impl OpusEncoder {
                 }
                 let silk_rate = self.sampling_rate.min(16000);
                 let pre_resampled_len = eb * silk_rate as usize / self.sampling_rate as usize;
-                let mut pre_internal = vec![0i16; pre_resampled_len.max(1)];
-                self.silk_resampler_enc.process(
-                    &mut pre_internal,
-                    &pre,
-                    eb as i32,
-                );
-                silk_encode_prefill(state_mut(&mut self.silk_enc), &pre_internal, 1);
+                let mut pre_internal = [0i16; 480];
+                let pre_internal = &mut pre_internal[..pre_resampled_len];
+                self.silk_resampler_enc
+                    .process(pre_internal, pre, eb as i32);
+                silk_encode_prefill(state_mut(&mut self.silk_enc), pre_internal, 1);
             }
 
             let required_size = frame_size * self.channels;
