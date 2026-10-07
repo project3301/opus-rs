@@ -118,6 +118,22 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
 
 ### Unreleased
 
+- **Stereo SILK/Hybrid codes the side, as libopus does (issue #48).** L and R
+  are resampled separately and converted to mid/side at the internal rate by
+  a bit-exact port of libopus's `silk_stereo_LR_to_MS`: predictor estimation
+  and quantization, stereo-width smoothing, the panned-mono and reduced-width
+  decisions, and the mid/side bit split. A second SILK channel codes the
+  side, with its own VAD, LBRR (in-band FEC) and rate control, and libopus's
+  side reset after mid-only frames. On the #42 signal each channel now
+  measures within 0.3 dB of libopus (R: +3.8 → +5.1 dB, libopus +5.1).
+  Anti-phase input, which decoded as silence, measures +7.0 dB per channel,
+  as libopus does. Two unrelated voices go from +1.9/+2.8 to +6.0/+9.3 dB
+  (libopus +5.4/+8.0). Hybrid splits its SILK rate per channel, as libopus's
+  `compute_silk_rate_for_hybrid` does. Mono output is unchanged, byte for
+  byte. Known gap: under CBR with in-band FEC, the side's LBRR adds to an
+  LBRR budget that doesn't come out of the frame target as in libopus
+  (#51), so stereo LBRR recovery in that regime is weaker than before;
+  the normal decode is better.
 - **Fix: stereo SILK/Hybrid decoded as L ≈ −0.63·mid, R ≈ 2.63·mid (issue
   #42).** The encoder codes stereo SILK as the mid only, but wrote stereo
   predictor index 0, which dequantizes to `pred_Q13 = (0, −13364)`. The
@@ -128,8 +144,7 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
   downmixed like SILK-only, which lifts the 24/48 kHz Hybrid mid from −2.4 dB
   to +5.8 dB SNR (libopus +5.9 dB). Both channels now carry the mid
   (L = R ≈ 0.85·mid, SNR +5.2/+3.8 dB, libopus +5.1/+5.1 dB with real side
-  coding). Real side coding (`silk_stereo_LR_to_MS`) is tracked for
-  follow-up.
+  coding), until #48 (above) adds the side.
 - **Fix: the SILK decoder's stereo predictor levels match libopus.** The
   half-step constant was `(1 << 16) / 10` = 6553 instead of libopus's
   `SILK_FIX_CONST(0.1, 16)` = 6554, so 45 of the 75 levels came out a few

@@ -76,10 +76,12 @@ pub fn silk_encode_prefill(ps_enc: &mut SilkEncoderState, samples: &[i16], _acti
 /// Prefill a stereo encoder with 10 ms of internal-rate `left` and `right`
 /// input, as libopus's `silk_Encode` does with `prefillFlag` set for two
 /// internal channels: convert to mid/side (updating the stereo state, writing
-/// nothing), run the VAD, and push the frame into the encoder's history
-/// without coding it. `total_rate_bps` is the SILK bitrate.
+/// nothing), run the VADs, and push the frame into the history of the mid
+/// and, unless the frame codes the mid only, of the side, without coding it.
+/// `total_rate_bps` is the SILK bitrate.
 pub fn silk_encode_prefill_stereo(
     mid: &mut SilkEncoderState,
+    side: &mut SilkEncoderState,
     left: &[i16],
     right: &[i16],
     total_rate_bps: i32,
@@ -111,13 +113,24 @@ pub fn silk_encode_prefill_stereo(
         fs_khz,
         prefill_frame_length,
     );
-    let mid_only = 1; // the side is not coded yet
     mid.stereo.pred_ix[0] = ix;
     mid.stereo.mid_only_flags[0] = mid_only;
 
     mid.s_cmn.n_frames_encoded = 0;
+    side.s_cmn.n_frames_encoded = 0;
+    if mid_only == 0 {
+        if mid.stereo.prev_decode_only_middle == 1 {
+            reset_side_for_coding(side);
+        }
+        silk_encode_do_vad(side, &x2[1..1 + prefill_frame_length], activity);
+    } else {
+        side.s_cmn.vad_flags[0] = 0;
+    }
     silk_encode_do_vad(mid, &x1[1..1 + prefill_frame_length], activity);
     prefill_frame(mid, &mut x1, prefill_frame_length);
+    if rates[1] > 0 {
+        prefill_frame(side, &mut x2, prefill_frame_length);
+    }
     mid.stereo.prev_decode_only_middle = mid_only as i32;
 }
 
@@ -908,14 +921,13 @@ pub fn silk_encode(
 ///
 /// `left` and `right` hold `n_samples_in` samples each, at the internal
 /// rate, de-interleaved. Each frame is converted to mid/side by
-/// [`silk_stereo_lr_to_ms`], which decides the predictors, the stereo width
-/// and the mid/side bit split. The stereo state lives in `mid.stereo`.
-///
-/// The side channel is not coded yet: every frame is written as panned mono,
-/// the mid at the whole frame rate with the estimated predictors and the
-/// mid-only flag, which the decoder turns back into a panned stereo image.
+/// [`silk_stereo_lr_to_ms`], which also picks the predictors, the stereo
+/// width and the split of the frame's bits between mid and side. `mid` codes
+/// the mid and holds the stereo state; `side` codes the side residual, except
+/// in frames that code the mid only (panned mono).
 pub fn silk_encode_stereo_packet(
     mid: &mut SilkEncoderState,
+    side: &mut SilkEncoderState,
     left: &[i16],
     right: &[i16],
     n_samples_in: usize,
@@ -937,6 +949,7 @@ pub fn silk_encode_stereo_packet(
     }
 
     mid.s_cmn.n_frames_encoded = 0;
+    side.s_cmn.n_frames_encoded = 0;
     let tot_blocks = packet_blocks(n_samples_in, fs_khz);
     let frame_rate_bps = frame_target_rate_bps(
         target_rate_bps,
@@ -944,20 +957,23 @@ pub fn silk_encode_stereo_packet(
         n_frames_per_packet,
     );
 
-    // LBRR flags left by the previous packet; a reset drops them.
+    // Each channel's LBRR flags left by the previous packet; a reset drops
+    // them.
     let lbrr_possible = mid.s_cmn.use_in_band_fec != 0
         && mid.s_cmn.packet_loss_perc > 0
         && mid.s_cmn.lbrr_enabled != 0;
-    if mid.s_cmn.first_frame_after_reset != 0 {
-        mid.s_cmn.lbrr_flags = [0; MAX_FRAMES_PER_PACKET];
-    }
-    let mut lbrr_symbol: i32 = 0;
-    if lbrr_possible {
-        for i in 0..n_frames_per_packet as usize {
-            lbrr_symbol |= mid.s_cmn.lbrr_flags[i] << i;
+    let mut lbrr_symbols = [0i32; 2];
+    for (symbol, ch) in lbrr_symbols.iter_mut().zip([&mut *mid, &mut *side]) {
+        if ch.s_cmn.first_frame_after_reset != 0 {
+            ch.s_cmn.lbrr_flags = [0; MAX_FRAMES_PER_PACKET];
         }
+        if lbrr_possible {
+            for i in 0..n_frames_per_packet as usize {
+                *symbol |= ch.s_cmn.lbrr_flags[i] << i;
+            }
+        }
+        ch.s_cmn.lbrr_flag = (*symbol > 0) as i8;
     }
-    mid.s_cmn.lbrr_flag = (lbrr_symbol > 0) as i8;
 
     let n_flag_bits = ((n_frames_per_packet + 1) * 2) as u32;
     let mut lbrr_bits_reserved = 0i32;
@@ -980,22 +996,38 @@ pub fn silk_encode_stereo_packet(
             let icdf = [(256i32 - (256i32 >> n_flag_bits)) as u8, 0u8];
             rc.encode_icdf(0, &icdf, 8);
 
-            if lbrr_symbol > 0 {
+            if lbrr_symbols != [0, 0] {
                 // Write the LBRR section only if the packet can hold it plus
                 // a minimal frame, as the mono path does.
                 let capacity_bits = (rc.storage as i32) * 8 - 8;
-                let saved = (mid.s_cmn.ec_prev_signal_type, mid.s_cmn.ec_prev_lag_index);
+                let saved = [&*mid, &*side]
+                    .map(|ch| (ch.s_cmn.ec_prev_signal_type, ch.s_cmn.ec_prev_lag_index));
                 let mut trial = rc.clone();
-                encode_lbrr_section_stereo(&mut trial, mid, lbrr_symbol, n_frames_per_packet);
-                (mid.s_cmn.ec_prev_signal_type, mid.s_cmn.ec_prev_lag_index) = saved;
+                encode_lbrr_section_stereo(
+                    &mut trial,
+                    mid,
+                    side,
+                    lbrr_symbols,
+                    n_frames_per_packet,
+                );
+                for (ch, saved) in [&mut *mid, &mut *side].into_iter().zip(saved) {
+                    (ch.s_cmn.ec_prev_signal_type, ch.s_cmn.ec_prev_lag_index) = saved;
+                }
                 if trial.tell() + 64 <= capacity_bits {
-                    lbrr_bits_reserved =
-                        encode_lbrr_section_stereo(rc, mid, lbrr_symbol, n_frames_per_packet);
+                    lbrr_bits_reserved = encode_lbrr_section_stereo(
+                        rc,
+                        mid,
+                        side,
+                        lbrr_symbols,
+                        n_frames_per_packet,
+                    );
                 } else {
                     mid.s_cmn.lbrr_flag = 0;
+                    side.s_cmn.lbrr_flag = 0;
                 }
             }
             mid.s_cmn.lbrr_flags = [0; MAX_FRAMES_PER_PACKET];
+            side.s_cmn.lbrr_flags = [0; MAX_FRAMES_PER_PACKET];
         }
 
         let (mut ix, mut mid_only, mut rates) = ([[0i8; 3]; 2], 0i8, [0i32; 2]);
@@ -1012,91 +1044,145 @@ pub fn silk_encode_stereo_packet(
             fs_khz,
             frame_length,
         );
-        // Panned mono: whatever the width decision, only the mid is coded,
-        // with the whole frame rate.
-        let mid_only = 1i8;
-        let mid_rate_bps = rates[0] + rates[1];
         mid.stereo.pred_ix[fi] = ix;
         mid.stereo.mid_only_flags[fi] = mid_only;
+        let side_after_mid_only = mid.stereo.prev_decode_only_middle == 1;
+        if mid_only == 0 {
+            if side_after_mid_only {
+                reset_side_for_coding(side);
+            }
+            silk_encode_do_vad(side, &x2[1..1 + frame_length], activity);
+        } else {
+            side.s_cmn.vad_flags[fi] = 0;
+        }
 
         silk_stereo_encode_pred(rc, &ix);
-        silk_stereo_encode_mid_only(rc, mid_only);
+        // A side with voice activity is coded, so the decoder knows the
+        // frame isn't mid-only without the flag.
+        if side.s_cmn.vad_flags[fi] == 0 {
+            silk_stereo_encode_mid_only(rc, mid_only);
+        }
         silk_encode_do_vad(mid, &x1[1..1 + frame_length], activity);
 
-        silk_control_snr(&mut mid.s_cmn, mid_rate_bps);
-        silk_lp_variable_cutoff(&mut mid.s_cmn.s_lp, &mut x1[1..], frame_length);
-        let cond_coding = if mid.s_cmn.n_frames_encoded == 0 {
-            CODE_INDEPENDENTLY
-        } else {
-            CODE_CONDITIONALLY
-        };
-        let frame_max_bits =
-            (silk_frame_max_bits(max_bits, tot_blocks, frame_idx) - lbrr_bits_reserved).max(48);
-        let frame_use_cbr = use_cbr != 0 && frame_idx == n_frames_per_packet - 1;
-        let mut frame_bytes = 0i32;
-        let ret = silk_encode_frame(
-            mid,
-            &x1[1..1 + frame_length],
-            rc,
-            &mut frame_bytes,
-            cond_coding,
-            frame_max_bits,
-            frame_use_cbr as i32,
-        );
-        if ret != 0 {
-            return ret;
+        for (n, (ch, buf)) in [(&mut *mid, &mut x1), (&mut *side, &mut x2)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut channel_max_bits = silk_frame_max_bits(max_bits, tot_blocks, frame_idx);
+            let mut channel_use_cbr = use_cbr != 0 && frame_idx == n_frames_per_packet - 1;
+            if n == 0 && rates[1] > 0 {
+                // The side fills the frame up to the cap; give the mid up to
+                // half of the frame's bits.
+                channel_use_cbr = false;
+                channel_max_bits -= max_bits / (tot_blocks * 2);
+            }
+            if rates[n] > 0 {
+                silk_control_snr(&mut ch.s_cmn, rates[n]);
+                let cond_coding = if frame_idx == 0 {
+                    CODE_INDEPENDENTLY
+                } else if n == 1 && side_after_mid_only {
+                    // The side's previous frame wasn't coded, but its LTP
+                    // state is well-defined after the reset.
+                    CODE_INDEPENDENTLY_NO_LTP_SCALING
+                } else {
+                    CODE_CONDITIONALLY
+                };
+                silk_lp_variable_cutoff(&mut ch.s_cmn.s_lp, &mut buf[1..], frame_length);
+                let mut frame_bytes = 0i32;
+                let ret = silk_encode_frame(
+                    ch,
+                    &buf[1..1 + frame_length],
+                    rc,
+                    &mut frame_bytes,
+                    cond_coding,
+                    (channel_max_bits - lbrr_bits_reserved).max(48),
+                    channel_use_cbr as i32,
+                );
+                if ret != 0 {
+                    return ret;
+                }
+            }
+            ch.s_cmn.n_frames_encoded += 1;
         }
-        mid.s_cmn.n_frames_encoded += 1;
         mid.stereo.prev_decode_only_middle = mid_only as i32;
     }
 
-    // VAD flags then the LBRR flag, for the mid and then for the side (which
-    // has none yet).
+    // Each channel's VAD flags then its LBRR flag, mid first.
     let mut flags = 0u32;
-    for i in 0..n_frames_per_packet as usize {
-        flags = (flags << 1) | mid.s_cmn.vad_flags[i] as u32;
+    for ch in [&*mid, &*side] {
+        for i in 0..n_frames_per_packet as usize {
+            flags = (flags << 1) | ch.s_cmn.vad_flags[i] as u32;
+        }
+        flags = (flags << 1) | ch.s_cmn.lbrr_flag as u32;
     }
-    flags = (flags << 1) | mid.s_cmn.lbrr_flag as u32;
-    flags <<= (n_frames_per_packet + 1) as u32;
     rc.patch_initial_bits(flags, n_flag_bits);
 
     *n_bytes_out = (rc.tell() + 7) >> 3;
     SILK_NO_ERROR
 }
 
-/// The LBRR section of a stereo packet (enc_API.c:352-389): the per-frame
-/// LBRR symbol for multi-frame packets, then each LBRR frame preceded by the
-/// stereo header of the frame it repeats. That header was written in the
-/// previous packet and is still in `pred_ix` / `mid_only_flags`. Returns the
-/// bits written.
+/// The LBRR section of a stereo packet (enc_API.c:352-389): each channel's
+/// per-frame LBRR symbol for multi-frame packets, then the LBRR frames, mid
+/// before side. A mid LBRR frame is preceded by the stereo header of the
+/// frame it repeats, written in the previous packet and still in `pred_ix` /
+/// `mid_only_flags`; its mid-only flag is implied when the side has LBRR too.
+/// Returns the bits written.
 fn encode_lbrr_section_stereo(
     rc: &mut RangeCoder,
     mid: &mut SilkEncoderState,
-    lbrr_symbol: i32,
+    side: &mut SilkEncoderState,
+    lbrr_symbols: [i32; 2],
     n_frames_per_packet: i32,
 ) -> i32 {
     let start_bits = rc.tell();
     if n_frames_per_packet > 1 {
-        rc.encode_icdf(lbrr_symbol - 1, lbrr_flags_icdf(n_frames_per_packet), 8);
+        for symbol in lbrr_symbols.into_iter().filter(|&s| s > 0) {
+            rc.encode_icdf(symbol - 1, lbrr_flags_icdf(n_frames_per_packet), 8);
+        }
     }
     for i in 0..n_frames_per_packet as usize {
         if mid.s_cmn.lbrr_flags[i] != 0 {
             silk_stereo_encode_pred(rc, &mid.stereo.pred_ix[i]);
-            silk_stereo_encode_mid_only(rc, mid.stereo.mid_only_flags[i]);
-            let cond_coding = if i > 0 && mid.s_cmn.lbrr_flags[i - 1] != 0 {
-                CODE_CONDITIONALLY
-            } else {
-                CODE_INDEPENDENTLY
-            };
-            silk_encode_indices(mid, rc, i, true, cond_coding);
-            silk_encode_pulses(
-                rc,
-                mid.s_cmn.indices_lbrr[i].signal_type as i32,
-                mid.s_cmn.indices_lbrr[i].quant_offset_type as i32,
-                &mid.s_cmn.pulses_lbrr[i],
-                mid.s_cmn.frame_length as usize,
-            );
+            if side.s_cmn.lbrr_flags[i] == 0 {
+                silk_stereo_encode_mid_only(rc, mid.stereo.mid_only_flags[i]);
+            }
+            encode_lbrr_frame(rc, mid, i);
+        }
+        if side.s_cmn.lbrr_flags[i] != 0 {
+            encode_lbrr_frame(rc, side, i);
         }
     }
     rc.tell() - start_bits
+}
+
+/// One channel's LBRR frame `i`: indices, then pulses.
+fn encode_lbrr_frame(rc: &mut RangeCoder, ch: &mut SilkEncoderState, i: usize) {
+    let cond_coding = if i > 0 && ch.s_cmn.lbrr_flags[i - 1] != 0 {
+        CODE_CONDITIONALLY
+    } else {
+        CODE_INDEPENDENTLY
+    };
+    silk_encode_indices(ch, rc, i, true, cond_coding);
+    silk_encode_pulses(
+        rc,
+        ch.s_cmn.indices_lbrr[i].signal_type as i32,
+        ch.s_cmn.indices_lbrr[i].quant_offset_type as i32,
+        &ch.s_cmn.pulses_lbrr[i],
+        ch.s_cmn.frame_length as usize,
+    );
+}
+
+/// Reset the side encoder's memory for its first coded frame after frames
+/// that coded the mid only, whose side was never coded (enc_API.c:441-453).
+fn reset_side_for_coding(side: &mut SilkEncoderState) {
+    side.s_shape = SilkShapeState::default();
+    side.s_nsq = SilkNSQState::default();
+    side.s_cmn.prev_nlsf_q15 = [0; MAX_LPC_ORDER];
+    side.s_cmn.s_lp.in_lp_state = [0; 2];
+    side.s_cmn.prev_lag = 100;
+    side.s_nsq.lag_prev = 100;
+    side.s_shape.last_gain_index = 10;
+    side.s_cmn.prev_signal_type = TYPE_NO_VOICE_ACTIVITY;
+    side.s_nsq.prev_gain_q16 = 65536;
+    side.s_cmn.first_frame_after_reset = 1;
 }

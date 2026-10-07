@@ -14,7 +14,9 @@
 //! same settings, decodes both with libopus, and measures each decoded
 //! channel against the input: its gain against the input mid must match
 //! libopus's, and its SNR come close. The opus-rs decoder must also agree
-//! with libopus on opus-rs's packets.
+//! with libopus on opus-rs's packets. Since #48 the encoder codes the side as
+//! libopus does, so the margins are tight; `issue_48_stereo_side.rs` covers
+//! the content that needs the side most.
 
 use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
@@ -243,11 +245,12 @@ fn run(cfg: &Config) -> Measured {
 /// alone both channels decoded at +0.85·mid, against libopus's +0.93 / +0.75.
 const GAIN_MARGIN: f64 = 0.08;
 /// How far below libopus's per-channel SNR opus-rs may fall. Coding the mid
-/// only costs the channel whose shape differs most from the mid; measured
-/// about 1.3 dB on R here.
-const CHANNEL_MARGIN_DB: f64 = 3.0;
+/// only cost the channel whose shape differs most from the mid about 1.3 dB
+/// on R here; with the side coded (#48) both channels measure within 0.3 dB
+/// of libopus.
+const CHANNEL_MARGIN_DB: f64 = 1.0;
 /// How far below libopus's mid SNR opus-rs may fall.
-const MID_MARGIN_DB: f64 = 2.0;
+const MID_MARGIN_DB: f64 = 1.0;
 /// Decoder agreement on opus-rs's packets, clean (issue_27's `MATCH_DB`).
 const MATCH_DB: f64 = 30.0;
 
@@ -300,7 +303,7 @@ fn check(cfg: Config) {
 }
 
 #[test]
-fn silk_wb_16k_vbr_decodes_mid_in_both_channels() {
+fn silk_wb_16k_vbr_matches_libopus_per_channel() {
     check(Config {
         name: "SILK WB 16 kHz VBR",
         sr: 16000,
@@ -311,7 +314,7 @@ fn silk_wb_16k_vbr_decodes_mid_in_both_channels() {
 }
 
 #[test]
-fn silk_wb_16k_cbr_decodes_mid_in_both_channels() {
+fn silk_wb_16k_cbr_matches_libopus_per_channel() {
     check(Config {
         name: "SILK WB 16 kHz CBR",
         sr: 16000,
@@ -322,7 +325,7 @@ fn silk_wb_16k_cbr_decodes_mid_in_both_channels() {
 }
 
 #[test]
-fn hybrid_swb_24k_vbr_decodes_mid_in_both_channels() {
+fn hybrid_swb_24k_vbr_matches_libopus_per_channel() {
     check(Config {
         name: "Hybrid SWB 24 kHz VBR",
         sr: 24000,
@@ -333,7 +336,7 @@ fn hybrid_swb_24k_vbr_decodes_mid_in_both_channels() {
 }
 
 #[test]
-fn hybrid_fb_48k_vbr_decodes_mid_in_both_channels() {
+fn hybrid_fb_48k_vbr_matches_libopus_per_channel() {
     check(Config {
         name: "Hybrid FB 48 kHz VBR",
         sr: 48000,
@@ -344,7 +347,7 @@ fn hybrid_fb_48k_vbr_decodes_mid_in_both_channels() {
 }
 
 #[test]
-fn hybrid_fb_48k_cbr_decodes_mid_in_both_channels() {
+fn hybrid_fb_48k_cbr_matches_libopus_per_channel() {
     check(Config {
         name: "Hybrid FB 48 kHz CBR",
         sr: 48000,

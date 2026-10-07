@@ -101,10 +101,17 @@ pub struct OpusEncoder {
     celt_enc: CeltEncoder,
     #[cfg(feature = "heap")]
     celt_enc: Box<CeltEncoder>,
+    /// SILK encoder for mono input, or for the mid of stereo input (it also
+    /// holds the stereo state).
     #[cfg(not(feature = "heap"))]
     silk_enc: SilkEncoderState,
     #[cfg(feature = "heap")]
     silk_enc: Box<SilkEncoderState>,
+    /// SILK encoder for the side of stereo input (libopus `state_Fxx[1]`).
+    #[cfg(not(feature = "heap"))]
+    silk_enc_side: SilkEncoderState,
+    #[cfg(feature = "heap")]
+    silk_enc_side: Box<SilkEncoderState>,
     application: Application,
     sampling_rate: i32,
     channels: usize,
@@ -342,7 +349,23 @@ fn compute_mode_threshold(
     threshold
 }
 
-fn compute_silk_rate_for_hybrid(rate_bps: i32, frame20ms: bool) -> i32 {
+/// SILK's share of a Hybrid packet's `rate_bps` (libopus
+/// `compute_silk_rate_for_hybrid`), allocated per channel: stereo codes the
+/// side with SILK too. Not ported: the FEC column, the CBR boost and the SWB
+/// boost.
+fn compute_silk_rate_for_hybrid(rate_bps: i32, frame20ms: bool, channels: usize) -> i32 {
+    let channels = channels as i32;
+    let rate_bps = rate_bps / channels;
+    let silk_rate = silk_rate_for_hybrid_per_channel(rate_bps, frame20ms) * channels;
+    // Small adjustment for stereo (libopus: "calibrated for 32 kb/s").
+    if channels == 2 && rate_bps >= 12000 {
+        silk_rate - 1000
+    } else {
+        silk_rate
+    }
+}
+
+fn silk_rate_for_hybrid_per_channel(rate_bps: i32, frame20ms: bool) -> i32 {
     const RATE_TABLE: &[(i32, i32, i32)] = &[
         (0, 0, 0),
         (12000, 10000, 10000),
@@ -379,29 +402,40 @@ mod silk_rate_tests {
 
     #[test]
     fn test_reference_table_exact_entries() {
-        assert_eq!(compute_silk_rate_for_hybrid(12000, true), 10000);
-        assert_eq!(compute_silk_rate_for_hybrid(16000, true), 13500);
-        assert_eq!(compute_silk_rate_for_hybrid(20000, true), 16000);
-        assert_eq!(compute_silk_rate_for_hybrid(24000, true), 18000);
-        assert_eq!(compute_silk_rate_for_hybrid(32000, true), 22000);
-        assert_eq!(compute_silk_rate_for_hybrid(64000, true), 38000);
+        assert_eq!(compute_silk_rate_for_hybrid(12000, true, 1), 10000);
+        assert_eq!(compute_silk_rate_for_hybrid(16000, true, 1), 13500);
+        assert_eq!(compute_silk_rate_for_hybrid(20000, true, 1), 16000);
+        assert_eq!(compute_silk_rate_for_hybrid(24000, true, 1), 18000);
+        assert_eq!(compute_silk_rate_for_hybrid(32000, true, 1), 22000);
+        assert_eq!(compute_silk_rate_for_hybrid(64000, true, 1), 38000);
     }
 
     #[test]
     fn test_32kbps_gives_22kbps_silk() {
-        assert_eq!(compute_silk_rate_for_hybrid(32000, true), 22000);
+        assert_eq!(compute_silk_rate_for_hybrid(32000, true, 1), 22000);
     }
 
     #[test]
     fn test_interpolation_between_table_entries() {
-        let r = compute_silk_rate_for_hybrid(18000, true);
+        let r = compute_silk_rate_for_hybrid(18000, true, 1);
         assert_eq!(r, 14750);
     }
 
     #[test]
     fn test_above_table_max_gives_half_extra() {
-        let r = compute_silk_rate_for_hybrid(72000, true);
+        let r = compute_silk_rate_for_hybrid(72000, true, 1);
         assert_eq!(r, 38000 + (72000 - 64000) / 2);
+    }
+
+    /// Stereo looks the rate up per channel, doubles it and, from 12 kb/s per
+    /// channel, takes 1 kb/s off (libopus opus_encoder.c).
+    #[test]
+    fn test_stereo_allocates_per_channel() {
+        let stereo = |rate| compute_silk_rate_for_hybrid(rate, true, 2);
+        assert_eq!(stereo(32000), 2 * 13500 - 1000);
+        assert_eq!(stereo(24000), 2 * 10000 - 1000);
+        assert_eq!(stereo(20000), 2 * 8333);
+        assert_eq!(stereo(64000), 2 * 22000 - 1000);
     }
 }
 
@@ -461,6 +495,13 @@ impl OpusEncoder {
         if silk_init_encoder(state_mut(&mut silk_enc), 0) != 0 {
             return Err("SILK encoder initialization failed");
         }
+        #[cfg(feature = "heap")]
+        let mut silk_enc_side = Box::new(SilkEncoderState::default());
+        #[cfg(not(feature = "heap"))]
+        let mut silk_enc_side = SilkEncoderState::default();
+        if silk_init_encoder(state_mut(&mut silk_enc_side), 0) != 0 {
+            return Err("SILK encoder initialization failed");
+        }
 
         let (opus_mode, bw) = match application {
             Application::Voip => {
@@ -514,6 +555,7 @@ impl OpusEncoder {
         Ok(Self {
             celt_enc,
             silk_enc,
+            silk_enc_side,
             application,
             sampling_rate,
             channels,
@@ -771,6 +813,7 @@ impl OpusEncoder {
             // silk_mode.LBRR_coded persists across frames even while SILK is
             // idle; it feeds decide_fec's hysteresis on the next SILK frame.
             self.silk_enc.s_cmn.lbrr_enabled = 0;
+            self.silk_enc_side.s_cmn.lbrr_enabled = 0;
         }
 
         if mode == OpusMode::CeltOnly {
@@ -918,8 +961,10 @@ impl OpusEncoder {
             if silk_restart_after_celt {
                 silk_init_encoder(state_mut(&mut self.silk_enc), 0);
                 if self.channels == 2 {
-                    // C silk_InitEncoder clears the stereo state too; the
-                    // next stereo frame starts it afresh.
+                    // C silk_InitEncoder clears the side encoder and the
+                    // stereo state too; the next stereo frame starts afresh.
+                    *state_mut(&mut self.silk_enc_side) = SilkEncoderState::default();
+                    silk_init_encoder(state_mut(&mut self.silk_enc_side), 0);
                     self.silk_enc.stereo.reset();
                 }
                 self.silk_initialized = false;
@@ -949,16 +994,32 @@ impl OpusEncoder {
                 }
                 if self.channels == 2 {
                     self.silk_resampler_enc_right = self.silk_resampler_enc.clone();
+                    // The side runs at the mid's rate and frame size (C
+                    // silk_control_encoder with force_fs_kHz).
+                    let side = state_mut(&mut self.silk_enc_side);
+                    silk_control_encoder(
+                        side,
+                        silk_fs_khz,
+                        frame_ms,
+                        silk_init_bitrate,
+                        self.complexity,
+                    );
+                    side.s_cmn.use_cbr = self.silk_enc.s_cmn.use_cbr;
+                    side.s_cmn.n_channels = 2;
                 }
             }
 
-            self.silk_enc.s_cmn.use_in_band_fec = if self.use_inband_fec { 1 } else { 0 };
-            self.silk_enc.s_cmn.packet_loss_perc = self.packet_loss_perc.clamp(0, 100);
-
             // C silk_setup_LBRR (control_codec.c): per-packet FEC state and
             // LBRR gain increase (7 on the first FEC packet, then
-            // max(7 - 0.2*loss, 2)).
-            silk_setup_lbrr(state_mut(&mut self.silk_enc), lbrr_coded);
+            // max(7 - 0.2*loss, 2)), for each coded channel.
+            for enc in [&mut self.silk_enc, &mut self.silk_enc_side]
+                .into_iter()
+                .take(self.channels)
+            {
+                enc.s_cmn.use_in_band_fec = if self.use_inband_fec { 1 } else { 0 };
+                enc.s_cmn.packet_loss_perc = self.packet_loss_perc.clamp(0, 100);
+                silk_setup_lbrr(state_mut(enc), lbrr_coded);
+            }
 
             let silk_frame_len_samples =
                 frame_size * silk_fs_khz as usize / (self.sampling_rate.max(1000) / 1000) as usize;
@@ -971,7 +1032,7 @@ impl OpusEncoder {
             let silk_bitrate = if mode == OpusMode::Hybrid {
                 let frame_duration_ms = frame_size as i32 * 1000 / self.sampling_rate;
                 let frame20ms = frame_duration_ms >= 20;
-                compute_silk_rate_for_hybrid(self.bitrate_bps, frame20ms)
+                compute_silk_rate_for_hybrid(self.bitrate_bps, frame20ms, self.channels)
             } else {
                 (8i64 * (n_bytes - 1) as i64 * silk_rate_for_calc as i64 / silk_frame_len as i64)
                     as i32
@@ -1014,6 +1075,7 @@ impl OpusEncoder {
                         .process(int_r, &pre_r[..eb], eb as i32);
                     silk_encode_prefill_stereo(
                         state_mut(&mut self.silk_enc),
+                        state_mut(&mut self.silk_enc_side),
                         int_l,
                         int_r,
                         silk_bitrate,
@@ -1141,6 +1203,7 @@ impl OpusEncoder {
                     let max_bit_rate = compute_silk_rate_for_hybrid(
                         total_max_bits * self.sampling_rate / frame_size as i32,
                         frame20ms,
+                        self.channels,
                     );
                     max_bit_rate * frame_size as i32 / self.sampling_rate
                 }
@@ -1157,6 +1220,7 @@ impl OpusEncoder {
             let ret = if self.channels == 2 {
                 silk_encode_stereo_packet(
                     state_mut(&mut self.silk_enc),
+                    state_mut(&mut self.silk_enc_side),
                     silk_input,
                     state_ref(&self.buf_silk_input_right),
                     silk_input.len(),
@@ -1238,7 +1302,8 @@ impl OpusEncoder {
             let celt_bitrate = if mode == OpusMode::Hybrid {
                 let frame_ms = frame_size as i32 * 1000 / self.sampling_rate;
                 let frame20ms = frame_ms >= 20;
-                let silk_rate = compute_silk_rate_for_hybrid(self.bitrate_bps, frame20ms);
+                let silk_rate =
+                    compute_silk_rate_for_hybrid(self.bitrate_bps, frame20ms, self.channels);
                 (self.bitrate_bps - silk_rate).max(8000)
             } else {
                 self.bitrate_bps
