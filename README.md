@@ -147,8 +147,18 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
   libopus does. This also fixes the code-3 VBR packet parser, which read frame
   lengths and frame data interleaved instead of all lengths first (libopus
   layout) — a latent bug that only surfaced once the encoder emitted code 3.
+- **Fix: 24 kHz CELT decoded to garbage (issue #37).** The CELT encoder always
+  coded all 21 bands, while the decoder derives its end band from the TOC
+  (SWB = 19 at 24 kHz); coding one band more than the decoder reads
+  desynchronised the range coder, turning every 24 kHz CELT packet into noise.
+  The encoder now takes `end_band` from the Opus bandwidth
+  (`CELT_SET_END_BAND`). It also zero-stuffs the API-rate input by
+  `resampling_factor(Fs)` and scales/zeroes the MDCT output for non-48 kHz
+  rates, as libopus `celt_preemphasis` / `compute_mdcts` do. 24 kHz `Audio`
+  now matches libopus (per-window correlation ~1.0, was ~0.04).
 - **Tests:** new libopus-oracle suites for SILK multi-frame/FEC (#27),
-  frame-loss concealment (#15), mono alignment (#34) and 40/60 ms frames (#35).
+  frame-loss concealment (#15), mono alignment (#34), 40/60 ms frames (#35)
+  and 24 kHz encoding (#37).
 
 ### 0.1.34
 
