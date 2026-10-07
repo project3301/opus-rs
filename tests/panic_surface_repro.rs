@@ -291,10 +291,9 @@ fn p2_encoder_extreme_fields_no_panic() {
 /// (10/20 ms) rates, mono and stereo, CBR and VBR, with a roomy and a tight
 /// output buffer.
 ///
-/// Configurations that fail without FEC are skipped: below about 10 kbps,
-/// 10 ms CBR packets are smaller than the cheapest SILK frame and overflow
-/// either way, and 48 kHz CBR at the 500 bps minimum trips the
-/// `RangeCoder::shrink` debug assertion either way.
+/// Configurations that fail without FEC are skipped: CBR budgets under 3 bytes
+/// per frame (#45), and CBR below 6 kb/s, 9 kb/s at 10 ms (#46), fail either
+/// way.
 #[test]
 fn p2_fec_never_breaks_a_working_configuration() {
     fn encode_all(
