@@ -837,7 +837,7 @@ impl OpusEncoder {
             }
             if self.use_cbr {
                 let target_total = n_bytes.min(output.len());
-                if target_total > ret {
+                if target_total >= 2 {
                     // opus_packet_pad of the TOC-only packet: code 3 with
                     // `m` empty frames and zero padding.
                     let m: usize = if packet_code == 3 {
@@ -849,17 +849,19 @@ impl OpusEncoder {
                     };
                     output[0] = (output[0] & 0xFC) | 0x03;
                     output[1] = 0x40 | m as u8; // padding present, CBR, m frames
-                    let pad_amount = target_total - 2;
-                    let nb_255s = (pad_amount - 1) / 255;
-                    let mut ptr = 2;
-                    for _ in 0..nb_255s {
-                        output[ptr] = 255;
+                    if target_total > 2 {
+                        let pad_amount = target_total - 2;
+                        let nb_255s = (pad_amount - 1) / 255;
+                        let mut ptr = 2;
+                        for _ in 0..nb_255s {
+                            output[ptr] = 255;
+                            ptr += 1;
+                        }
+                        output[ptr] = (pad_amount - 255 * nb_255s - 1) as u8;
                         ptr += 1;
-                    }
-                    output[ptr] = (pad_amount - 255 * nb_255s - 1) as u8;
-                    ptr += 1;
-                    for b in &mut output[ptr..target_total] {
-                        *b = 0;
+                        for b in &mut output[ptr..target_total] {
+                            *b = 0;
+                        }
                     }
                     ret = target_total;
                 }

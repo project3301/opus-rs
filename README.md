@@ -116,6 +116,27 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
 
 ## Release Notes
 
+### 0.1.37
+
+- **Fix: starved CBR budgets (issues #45, #46).** Budgets below 3 bytes per
+  frame (and other starved budgets) now emit libopus's TOC-only "PLC" packet
+  — padded under CBR, with the 40/60 ms multiframe TOC rules — instead of
+  failing with a range-coder error (debug builds panicked in
+  `RangeCoder::shrink`). Budgets below ~6 kb/s (9 kb/s above 20 ms) switch to
+  CELT-only mode and code small valid packets, as libopus does
+  (opus_encoder.c:1226-1286, 1525-1527). Known gap: at 5-6 byte CELT packets
+  the payload's tail bits differ from libopus's, costing some SNR — tracked
+  for follow-up.
+- **Fix: 60 ms SILK packets cap the first two frames at 2/5 and 3/4 of the
+  packet (enc_API.c parity, from PR #44).** Without the caps a 60 ms packet's
+  early frames could leave the last one under its no-pulse fallback cost.
+- **CELT transients are analysed on unfiltered history (PR #47).** The
+  tone/transient analysis saw a prefiltered overlap head against an
+  unfiltered body, reading a comb-filter step as a transient on steady
+  pitched input; 48 kHz Audio at 20-24 kbps lost its first ~200 ms. Now
+  lag 0, correlation 1.00 from the first window, and only the onset frame
+  is coded with short blocks.
+
 ### Unreleased
 
 - **Fix: CELT flagged transients on steady pitched input (issue #38).** The
