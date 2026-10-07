@@ -4,7 +4,7 @@ use crate::silk::control_snr::silk_control_snr;
 use crate::silk::define::*;
 use crate::silk::encode_indices::*;
 use crate::silk::encode_pulses::*;
-use crate::silk::gain_quant::{silk_gains_id, silk_gains_quant};
+use crate::silk::gain_quant::{silk_gains_dequant, silk_gains_id, silk_gains_quant};
 use crate::silk::hp_variable_cutoff::silk_hp_variable_cutoff;
 use crate::silk::lp_variable_cutoff::*;
 use crate::silk::macros::*;
@@ -157,6 +157,13 @@ pub fn silk_encode_frame(
     );
 
     silk_process_gains_fix(ps_enc, &mut s_enc_ctrl, cond_coding);
+
+    /****************************************/
+    /* Low Bitrate Redundant Encoding       */
+    /****************************************/
+    // Port of silk_LBRR_encode_FIX: runs on the frame-entry NSQ state, i.e.
+    // after the gains are quantized and before the rate-control loop below.
+    silk_lbrr_encode(ps_enc, &s_enc_ctrl, x_frame_idx, cond_coding);
 
     let max_iter = 6;
     let mut gain_mult_q8: i32 = 256;
@@ -433,6 +440,112 @@ pub fn silk_encode_frame(
     0
 }
 
+/// Low-Bitrate Redundancy (LBRR) encoding: reuse all parameters but encode
+/// the excitation at a lower rate. Port of `silk_LBRR_encode_FIX`
+/// (encode_frame_FIX.c:391-448), called after the gains are quantized and
+/// before the rate-control loop, so the NSQ state is the frame-entry state.
+///
+/// On success this frame's LBRR payload lives in
+/// `s_cmn.indices_lbrr[fi]` / `s_cmn.pulses_lbrr[fi]` and
+/// `s_cmn.lbrr_flags[fi]` is set for the *next* packet's LBRR section.
+fn silk_lbrr_encode(
+    ps_enc: &mut SilkEncoderState,
+    s_enc_ctrl: &SilkEncoderControl,
+    x16_offset: usize,
+    cond_coding: i32,
+) {
+    // Control use of inband LBRR. LBRR_SPEECH_ACTIVITY_THRES = 0.3
+    // (SILK_FIX_CONST(0.3, 8) = 77).
+    if ps_enc.s_cmn.lbrr_enabled == 0
+        || ps_enc.s_cmn.speech_activity_q8 <= 77
+    {
+        return;
+    }
+
+    let fi = ps_enc.s_cmn.n_frames_encoded as usize;
+    if fi >= MAX_FRAMES_PER_PACKET {
+        return;
+    }
+    ps_enc.s_cmn.lbrr_flags[fi] = 1;
+
+    // Copy noise shaping quantizer state and quantization indices from the
+    // regular encoding.
+    let mut nsq_lbrr = ps_enc.s_nsq;
+    let mut indices_lbrr = ps_enc.s_cmn.indices;
+
+    if fi == 0 || ps_enc.s_cmn.lbrr_flags[fi - 1] == 0 {
+        // First frame in packet or previous frame not LBRR coded.
+        ps_enc.s_cmn.lbrr_prev_last_gain_index = ps_enc.s_shape.last_gain_index;
+
+        // Increase gains to get the target LBRR rate. This index is coded
+        // absolutely here (first frame of an LBRR run), so it must stay
+        // within 0..=N_LEVELS_QGAIN-1.
+        indices_lbrr.gains_indices[0] = (indices_lbrr.gains_indices[0] as i32
+            + ps_enc.s_cmn.lbrr_gain_increases)
+            .min(N_LEVELS_QGAIN - 1) as i8;
+    }
+
+    // Decode to get gains in sync with the decoder. Works on a scratch copy
+    // of the gains; the main frame's gains are left untouched.
+    let mut gains_lbrr = s_enc_ctrl.gains_q16;
+    silk_gains_dequant(
+        &mut gains_lbrr,
+        &indices_lbrr.gains_indices,
+        &mut ps_enc.s_cmn.lbrr_prev_last_gain_index,
+        if cond_coding == CODE_CONDITIONALLY { 1 } else { 0 },
+        ps_enc.s_cmn.nb_subfr as usize,
+    );
+
+    let mut pred_coef_q12_flat = [0i16; 2 * MAX_LPC_ORDER];
+    pred_coef_q12_flat[..MAX_LPC_ORDER].copy_from_slice(&s_enc_ctrl.pred_coef_q12[0]);
+    pred_coef_q12_flat[MAX_LPC_ORDER..].copy_from_slice(&s_enc_ctrl.pred_coef_q12[1]);
+
+    /*****************************************/
+    /* Noise shaping quantization            */
+    /*****************************************/
+    let mut pulses_lbrr = [0i8; MAX_FRAME_LENGTH];
+    if ps_enc.s_cmn.n_states_delayed_decision > 1 || ps_enc.s_cmn.warping_q16 > 0 {
+        silk_nsq_del_dec(
+            &ps_enc.s_cmn,
+            &mut nsq_lbrr,
+            &indices_lbrr,
+            &ps_enc.s_cmn.x_buf[x16_offset..],
+            &mut pulses_lbrr,
+            &pred_coef_q12_flat,
+            &s_enc_ctrl.ltp_coef_q14,
+            &s_enc_ctrl.ar_q13,
+            &s_enc_ctrl.harm_shape_gain_q14,
+            &s_enc_ctrl.tilt_q14,
+            &s_enc_ctrl.lf_shp_q14,
+            &gains_lbrr,
+            &s_enc_ctrl.pitch_l,
+            s_enc_ctrl.lambda_q10,
+            s_enc_ctrl.ltp_scale_q14,
+        );
+    } else {
+        silk_nsq(
+            &ps_enc.s_cmn,
+            &mut nsq_lbrr,
+            &indices_lbrr,
+            &ps_enc.s_cmn.x_buf[x16_offset..],
+            &mut pulses_lbrr,
+            &pred_coef_q12_flat,
+            &s_enc_ctrl.ltp_coef_q14,
+            &s_enc_ctrl.ar_q13,
+            &s_enc_ctrl.harm_shape_gain_q14,
+            &s_enc_ctrl.tilt_q14,
+            &s_enc_ctrl.lf_shp_q14,
+            &gains_lbrr,
+            &s_enc_ctrl.pitch_l,
+            s_enc_ctrl.lambda_q10,
+            s_enc_ctrl.ltp_scale_q14,
+        );
+    }
+
+    ps_enc.s_cmn.indices_lbrr[fi] = indices_lbrr;
+    ps_enc.s_cmn.pulses_lbrr[fi] = pulses_lbrr;
+}
+
 /// Encode the LBRR (in-band FEC) section for a whole packet and return the
 /// number of bits written. Matches libopus enc_API.c:365-371: an LBRR symbol
 /// for multi-frame packets, then per frame a stereo header (when stereo)
@@ -526,21 +639,21 @@ pub fn silk_encode(
         && ps_enc.s_cmn.packet_loss_perc > 0
         && ps_enc.s_cmn.lbrr_enabled != 0;
 
+    // The LBRR flags persisted from the previous packet's frames describe the
+    // LBRR payload written at the start of this packet (enc_API.c builds
+    // LBRR_symbol from LBRR_flags). A reset drops them (enc_API.c:255-259).
+    if ps_enc.s_cmn.first_frame_after_reset != 0 {
+        ps_enc.s_cmn.lbrr_flags = [0; MAX_FRAMES_PER_PACKET];
+    }
+
     let mut lbrr_symbol: i32 = 0;
     if lbrr_possible {
         for i in 0..n_frames_per_packet as usize {
-            if ps_enc.s_cmn.indices_lbrr[i].signal_type >= TYPE_UNVOICED as i8 {
-                lbrr_symbol |= 1 << i;
-            }
+            lbrr_symbol |= ps_enc.s_cmn.lbrr_flags[i] << i;
         }
     }
-    let use_lbrr = lbrr_symbol > 0;
 
     ps_enc.s_cmn.lbrr_flag = if lbrr_symbol > 0 { 1 } else { 0 };
-
-    for i in 0..n_frames_per_packet as usize {
-        ps_enc.s_cmn.lbrr_flags[i] = (lbrr_symbol >> i) & 1;
-    }
 
     let mut sample_offset = 0usize;
 
@@ -634,10 +747,14 @@ pub fn silk_encode(
                         encode_lbrr_section(rc, ps_enc, lbrr_symbol, n_frames_per_packet);
                 } else {
                     ps_enc.s_cmn.lbrr_flag = 0;
-                    ps_enc.s_cmn.lbrr_flags = [0; MAX_FRAMES_PER_PACKET];
                     lbrr_symbol = 0;
                 }
             }
+
+            // Reset the LBRR flags for the next packet (enc_API.c:379-382);
+            // this packet's frames set them again from inside
+            // silk_lbrr_encode.
+            ps_enc.s_cmn.lbrr_flags = [0; MAX_FRAMES_PER_PACKET];
 
             // NOTE: the per-frame stereo header is written further below (after
             // VAD), once for every frame of the packet — matching libopus
@@ -691,29 +808,6 @@ pub fn silk_encode(
         );
         if ret != 0 {
             return ret;
-        }
-
-        if use_lbrr || ps_enc.s_cmn.use_in_band_fec != 0 {
-            let fi = frame_idx as usize;
-            if fi < MAX_FRAMES_PER_PACKET {
-                ps_enc.s_cmn.indices_lbrr[fi] = ps_enc.s_cmn.indices;
-
-                // Like libopus silk_LBRR_encode: raise only the first gain
-                // index, and only when this LBRR frame is coded independently
-                // (absolute index, 0..=63). Indices 1.. — and index 0 of a
-                // conditionally coded frame — are deltas into the 41-entry
-                // SILK_DELTA_GAIN_ICDF; raising those could push a symbol past
-                // the table.
-                let coded_independently =
-                    fi == 0 || ps_enc.s_cmn.indices_lbrr[fi - 1].signal_type < TYPE_UNVOICED as i8;
-                if coded_independently {
-                    let gain_inc = ps_enc.s_cmn.lbrr_gain_increases.clamp(0, 16);
-                    let g0 = &mut ps_enc.s_cmn.indices_lbrr[fi].gains_indices[0];
-                    *g0 = (*g0 as i32 + gain_inc).min(N_LEVELS_QGAIN - 1) as i8;
-                }
-
-                ps_enc.s_cmn.pulses_lbrr[fi] = ps_enc.pulses;
-            }
         }
 
         ps_enc.s_cmn.n_frames_encoded += 1;

@@ -208,14 +208,15 @@ fn issue_27_2a_stereo_40ms_roundtrip_both_frames_consistent() {
 /// stereo packet carrying LBRR desynced immediately. The LBRR section must
 /// also gracefully degrade when it does not fit the packet budget.
 ///
-/// At CBR the LBRR section never fits, so this covers the budget fallback;
-/// `issue_27_libopus_oracle.rs` uses VBR to check the LBRR payloads
-/// themselves against libopus.
+/// VBR so the LBRR section is actually carried (issue #36: with a real,
+/// low-rate LBRR payload it now also fits under CBR) — every packet then
+/// exercises the skip path with live LBRR data. The main frame shares the
+/// budget with LBRR, exactly as in libopus, so the floor is a bit lower than
+/// the no-FEC case.
 #[test]
 fn issue_27_2b_stereo_fec_roundtrip_consistent() {
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
     enc.bitrate_bps = 24000;
-    enc.use_cbr = true;
     enc.use_inband_fec = true;
     enc.packet_loss_perc = 40;
     let frame = 320; // 20 ms
@@ -236,6 +237,48 @@ fn issue_27_2b_stereo_fec_roundtrip_consistent() {
         let (snr_first, snr_second) = half_snrs(&pcm, &input, samples, 2);
         assert!(
             snr_first > 8.0 && snr_second > 8.0,
+            "packet {pkt_idx}: LBRR stereo desync — snr_first={snr_first:.1} dB, snr_second={snr_second:.1} dB"
+        );
+    }
+}
+
+/// Same stream at CBR: LBRR now fits the packet budget (issue #36), so the
+/// main frame shares bits with it and loses some quality — the payload must
+/// still decode cleanly. (At 24 kbps CBR even libopus's own decode degrades
+/// to about -1..-3 dB because LBRR + main frame exceed the packet; 32 kbps is
+/// the lowest config where both fit, matching the oracle tests' CBR setup.)
+#[test]
+fn issue_27_2b_stereo_fec_cbr_roundtrip_consistent() {
+    let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+    enc.bitrate_bps = 32000;
+    enc.use_cbr = true;
+    enc.use_inband_fec = true;
+    enc.packet_loss_perc = 40;
+    let frame = 320; // 20 ms
+
+    let mut dec = OpusDecoder::new(16000, 2).unwrap();
+    for pkt_idx in 0..8 {
+        let input = sine_input(frame, 16000, 2);
+        let mut pkt = vec![0u8; 1500];
+        let n = enc
+            .encode(&input, frame, &mut pkt)
+            .unwrap_or_else(|e| panic!("packet {pkt_idx}: encode failed: {e}"));
+        assert_eq!(n, 80, "CBR packet size");
+        let mut pcm = vec![0.0f32; frame * 2];
+        let samples = dec
+            .decode(&pkt[..n], frame, &mut pcm)
+            .unwrap_or_else(|e| panic!("packet {pkt_idx}: decode failed: {e}"));
+        assert_eq!(samples, frame);
+
+        let (snr_first, snr_second) = half_snrs(&pcm, &input, samples, 2);
+        // C opus_encoder.c:2170-2179: when LBRR + main frame exceed the packet
+        // budget (the cold-start first-FEC packet is the worst case — libopus
+        // busts here too), the encoder degrades to a padded single-frame
+        // packet the decoder plays as near-silence. That is the graceful
+        // path, not a desync: require clean audio only for regular packets.
+        let fallback_packet = pkt[0] & 0x03 == 0x03;
+        assert!(
+            fallback_packet || (snr_first > 8.0 && snr_second > 8.0),
             "packet {pkt_idx}: LBRR stereo desync — snr_first={snr_first:.1} dB, snr_second={snr_second:.1} dB"
         );
     }

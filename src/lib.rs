@@ -31,7 +31,7 @@ use crate::fixedvec::FixedVec;
 pub use celt::{CeltDecoder, CeltEncoder};
 use hp_cutoff::{dc_reject_float, hp_cutoff, hp_cutoff_float, hp_cutoff_i16};
 use range_coder::RangeCoder;
-use silk::control_codec::silk_control_encoder;
+use silk::control_codec::{silk_control_encoder, silk_setup_lbrr};
 use silk::enc_api::silk_encode;
 use silk::init_encoder::silk_init_encoder;
 use silk::lin2log::silk_lin2log;
@@ -217,6 +217,85 @@ fn compute_equiv_rate(
         equiv -= equiv * loss / (12 * loss + 20);
     }
     equiv
+}
+
+/// `fec_thresholds` (opus_encoder.c:160): LBRR rate threshold and hysteresis
+/// per bandwidth, starting at narrowband.
+const FEC_THRESHOLDS: [i32; 10] = [
+    12000, 1000, // NB
+    14000, 1000, // MB
+    16000, 1000, // WB
+    20000, 1000, // SWB
+    22000, 1000, // FB
+];
+
+fn bandwidth_fec_index(bw: Bandwidth) -> usize {
+    match bw {
+        Bandwidth::Narrowband => 0,
+        Bandwidth::Mediumband => 1,
+        Bandwidth::Wideband => 2,
+        Bandwidth::Superwideband => 3,
+        Bandwidth::Fullband | Bandwidth::Auto => 4,
+    }
+}
+
+fn bandwidth_from_fec_index(idx: usize) -> Bandwidth {
+    match idx {
+        0 => Bandwidth::Narrowband,
+        1 => Bandwidth::Mediumband,
+        2 => Bandwidth::Wideband,
+        3 => Bandwidth::Superwideband,
+        _ => Bandwidth::Fullband,
+    }
+}
+
+/// Port of opus_encoder.c `decide_fec()`: gate in-band FEC on the packet loss
+/// setting and on whether the equivalent rate can afford LBRR at the current
+/// bandwidth. With loss > 5%, the bandwidth is reduced until FEC fits; the
+/// caller's per-frame bandwidth is updated accordingly.
+fn decide_fec(
+    use_in_band_fec: i32,
+    packet_loss_perc: i32,
+    last_fec: i32,
+    mode: OpusMode,
+    bandwidth: &mut Bandwidth,
+    rate: i32,
+) -> i32 {
+    if use_in_band_fec == 0 || packet_loss_perc == 0 || mode == OpusMode::CeltOnly {
+        return 0;
+    }
+    let orig_bandwidth = *bandwidth;
+    loop {
+        let idx = bandwidth_fec_index(*bandwidth);
+        let mut lbrr_rate_thres_bps = FEC_THRESHOLDS[2 * idx];
+        let hysteresis = FEC_THRESHOLDS[2 * idx + 1];
+        if last_fec == 1 {
+            lbrr_rate_thres_bps -= hysteresis;
+        }
+        if last_fec == 0 {
+            lbrr_rate_thres_bps += hysteresis;
+        }
+        // silk_SMULWB(threshold * (125 - min(loss, 25)), 0.01 in Q16)
+        lbrr_rate_thres_bps = silk_smulwb(
+            lbrr_rate_thres_bps * (125 - packet_loss_perc.min(25)),
+            655,
+        );
+        // If loss <= 5%, we look at whether we have enough rate to enable FEC.
+        // If loss > 5%, we decrease the bandwidth until we can enable FEC.
+        if rate > lbrr_rate_thres_bps {
+            return 1;
+        } else if packet_loss_perc <= 5 {
+            return 0;
+        } else if bandwidth_fec_index(*bandwidth) > 0 {
+            let lower = bandwidth_fec_index(*bandwidth) - 1;
+            *bandwidth = bandwidth_from_fec_index(lower);
+        } else {
+            break;
+        }
+    }
+    // Couldn't find any bandwidth to enable FEC, keep original bandwidth.
+    *bandwidth = orig_bandwidth;
+    0
 }
 
 fn compute_mode_threshold(
@@ -626,6 +705,35 @@ impl OpusEncoder {
             return self.encode_multiframe(input, frame_size, mode, output);
         }
 
+        // C opus_encoder.c: with mode and bandwidth settled, decide whether
+        // this packet codes in-band FEC (decide_fec()); it can lower the
+        // frame's bandwidth when a high loss rate demands FEC at any cost.
+        // The reduction is per-frame: `self.bandwidth` (the user/auto state)
+        // is left untouched, matching C where the bandwidth is re-derived
+        // every frame.
+        let mut frame_bandwidth = self.bandwidth;
+        let equiv_rate = compute_equiv_rate(
+            self.bitrate_bps,
+            self.channels,
+            frame_rate,
+            !self.use_cbr,
+            self.complexity,
+            self.packet_loss_perc,
+        );
+        let lbrr_coded = decide_fec(
+            if self.use_inband_fec { 1 } else { 0 },
+            self.packet_loss_perc,
+            self.silk_enc.s_cmn.lbrr_enabled,
+            mode,
+            &mut frame_bandwidth,
+            equiv_rate,
+        );
+        if mode == OpusMode::CeltOnly {
+            // silk_mode.LBRR_coded persists across frames even while SILK is
+            // idle; it feeds decide_fec's hysteresis on the next SILK frame.
+            self.silk_enc.s_cmn.lbrr_enabled = 0;
+        }
+
         if mode == OpusMode::CeltOnly {
             match frame_rate {
                 400 | 200 | 100 | 50 => {}
@@ -647,7 +755,7 @@ impl OpusEncoder {
             }
         }
 
-        let toc = gen_toc(mode, frame_rate, self.bandwidth, self.channels);
+        let toc = gen_toc(mode, frame_rate, frame_bandwidth, self.channels);
         output[0] = toc;
 
         let target_bits =
@@ -719,11 +827,10 @@ impl OpusEncoder {
             self.silk_enc.s_cmn.use_in_band_fec = if self.use_inband_fec { 1 } else { 0 };
             self.silk_enc.s_cmn.packet_loss_perc = self.packet_loss_perc.clamp(0, 100);
 
-            self.silk_enc.s_cmn.lbrr_enabled = if self.use_inband_fec { 1 } else { 0 };
-
-            if self.silk_enc.s_cmn.lbrr_gain_increases == 0 {
-                self.silk_enc.s_cmn.lbrr_gain_increases = 2;
-            }
+            // C silk_setup_LBRR (control_codec.c): per-packet FEC state and
+            // LBRR gain increase (7 on the first FEC packet, then
+            // max(7 - 0.2*loss, 2)).
+            silk_setup_lbrr(state_mut(&mut self.silk_enc), lbrr_coded);
 
             let required_size = frame_size * self.channels;
             self.buf_filtered.resize(required_size, 0);
@@ -949,7 +1056,7 @@ impl OpusEncoder {
             let start_band = if mode == OpusMode::Hybrid { 17 } else { 0 };
             // libopus `CELT_SET_END_BAND`: match the TOC bandwidth so the
             // decoder reads the same number of coded bands (issue #37).
-            let end_band = match self.bandwidth {
+            let end_band = match frame_bandwidth {
                 Bandwidth::Narrowband => 13,
                 Bandwidth::Mediumband | Bandwidth::Wideband => 17,
                 Bandwidth::Superwideband => 19,
@@ -1095,8 +1202,48 @@ impl OpusEncoder {
 
         self.rc.done();
 
-        if self.rc.error != 0 {
-            return Err("Range coder buffer overflow: encoded data exceeds packet budget");
+        // C opus_encoder.c:2170-2179: "In the unlikely case that the SILK
+        // encoder busted its target, tell the decoder to call the PLC" — emit
+        // a minimal packet with an EMPTY frame instead of failing hard. The
+        // zero-length frame makes the decoder conceal (libopus pads the same
+        // 2-byte packet with opus_packet_pad under CBR). With FEC the LBRR
+        // section can squeeze the main frame below what even the
+        // damage-control re-encode fits, which is exactly the case this
+        // fallback exists for.
+        if self.rc.error != 0 || self.rc.tell() > (n_bytes as i32 - 1) * 8 {
+            if output.len() < 2 {
+                return Err("Output buffer too small");
+            }
+            let mut ret = 2usize;
+            if self.use_cbr && n_bytes >= 2 {
+                // CBR: pad to the nominal size as a code-3 packet holding a
+                // single EMPTY frame (opus_packet_pad of the 2-byte packet).
+                let target_total = n_bytes.min(output.len());
+                if target_total > 2 {
+                    output[0] = toc | 0x03;
+                    output[1] = 0x41; // 1 frame, padding present, CBR
+                    let pad_amount = target_total - 2;
+                    let nb_255s = (pad_amount - 1) / 255;
+                    let mut ptr = 2;
+                    for _ in 0..nb_255s {
+                        output[ptr] = 255;
+                        ptr += 1;
+                    }
+                    output[ptr] = (pad_amount - 255 * nb_255s - 1) as u8;
+                    ptr += 1;
+                    for b in &mut output[ptr..target_total] {
+                        *b = 0;
+                    }
+                    self.prev_enc_mode = Some(mode);
+                    return Ok(target_total);
+                }
+                ret = target_total.max(1);
+            }
+            // VBR: a 2-byte code-0 packet whose frame length byte is 0.
+            output[0] = toc;
+            output[1] = 0;
+            self.prev_enc_mode = Some(mode);
+            return Ok(ret);
         }
 
         if mode == OpusMode::SilkOnly {
@@ -1678,15 +1825,23 @@ impl OpusDecoder {
                 self.prev_internal_rate = internal_sample_rate;
 
                 for (fi, payload) in frame_payloads.iter().enumerate() {
+                    let out_start = fi * sub_output_len;
+                    // C opus_decode_frame: a zero-length frame (e.g. the
+                    // encoder's busted-budget fallback packet) is concealed,
+                    // not decoded.
+                    let flag = if payload.is_empty() {
+                        silk::decode_frame::FLAG_PACKET_LOST
+                    } else {
+                        silk::decode_frame::FLAG_DECODE_NORMAL
+                    };
                     let mut rc = RangeCoder::new_decoder(payload);
                     self.decode_silk_frames(
                         &mut rc,
-                        silk::decode_frame::FLAG_DECODE_NORMAL,
+                        flag,
                         frame_duration_ms,
                         internal_sample_rate,
                         sub_frame_size,
                     )?;
-                    let out_start = fi * sub_output_len;
                     output[out_start..out_start + sub_output_len]
                         .copy_from_slice(&self.w_silk_out[..sub_output_len]);
                 }
@@ -1757,9 +1912,16 @@ impl OpusDecoder {
                 for (fi, payload) in frame_payloads.iter().enumerate() {
                     let mut rc = RangeCoder::new_decoder(payload);
                     // SILK layer of this frame -> w_silk_out (interleaved, API rate).
+                    // A zero-length frame is concealed, not decoded (C
+                    // opus_decode_frame).
+                    let flag = if payload.is_empty() {
+                        silk::decode_frame::FLAG_PACKET_LOST
+                    } else {
+                        silk::decode_frame::FLAG_DECODE_NORMAL
+                    };
                     self.decode_silk_frames(
                         &mut rc,
-                        silk::decode_frame::FLAG_DECODE_NORMAL,
+                        flag,
                         frame_duration_ms,
                         internal_sample_rate,
                         sub_frame_size,

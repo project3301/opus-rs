@@ -174,6 +174,10 @@ pub struct SilkEncoderStateCommon {
     pub sum_log_gain_q7: i32,
     pub packet_loss_perc: i32,
     pub lbrr_flag: i8,
+    /// C `LBRRprevLastGainIndex`: gain-index chain state kept in sync with
+    /// the decoder's LBRR gain decoding, separate from the main
+    /// `sShape.LastGainIndex` chain (silk_LBRR_encode_FIX).
+    pub lbrr_prev_last_gain_index: i8,
     pub no_speech_counter: i32,
     pub in_dtx: i32,
     pub vad_flags: [i32; MAX_FRAMES_PER_PACKET],
@@ -243,6 +247,7 @@ impl Default for SilkEncoderStateCommon {
             sum_log_gain_q7: 0,
             packet_loss_perc: 0,
             lbrr_flag: 0,
+            lbrr_prev_last_gain_index: 0,
             no_speech_counter: 0,
             in_dtx: 0,
             vad_flags: [0; MAX_FRAMES_PER_PACKET],

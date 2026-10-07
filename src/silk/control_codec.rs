@@ -1,4 +1,5 @@
 use crate::silk::define::*;
+use crate::silk::macros::silk_smulwb;
 use crate::silk::structs::*;
 use crate::silk::tables_nlsf::*;
 
@@ -158,4 +159,27 @@ pub fn silk_control_encoder(
     ps_enc.s_cmn.target_rate_bps = target_rate_bps;
 
     ret
+}
+
+/// Port of `silk_setup_LBRR` (control_codec.c:403-423): track the
+/// packet-to-packet FEC state and derive the gain increase used when coding
+/// LBRR excitation. `lbrr_coded` is the (already decided) per-packet FEC flag
+/// — in libopus that is `encControl->LBRR_coded`, produced by opus_encoder.c's
+/// `decide_fec()`.
+pub fn silk_setup_lbrr(ps_enc: &mut SilkEncoderState, lbrr_coded: i32) -> i32 {
+    let lbrr_in_previous_packet = ps_enc.s_cmn.lbrr_enabled;
+    ps_enc.s_cmn.lbrr_enabled = lbrr_coded;
+    if ps_enc.s_cmn.lbrr_enabled != 0 {
+        if lbrr_in_previous_packet == 0 {
+            // Previous packet did not have LBRR, and was therefore coded at a
+            // higher bitrate.
+            ps_enc.s_cmn.lbrr_gain_increases = 7;
+        } else {
+            // silk_max_int(7 - SMULWB(PacketLoss_perc, 0.4 in Q16), 2)
+            ps_enc.s_cmn.lbrr_gain_increases =
+                (7 - silk_smulwb(ps_enc.s_cmn.packet_loss_perc, 26214)).max(2);
+        }
+    }
+
+    SILK_NO_ERROR
 }

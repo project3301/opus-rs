@@ -354,28 +354,99 @@ fn opus_rs_40ms_stereo_decodes_in_libopus() {
 /// not cost the main frame anything), and libopus must recover each previous
 /// frame from the LBRR section.
 ///
-/// VBR, because at CBR the LBRR section never fits the packet budget and is
-/// dropped, which would leave the LBRR path untested. Mono is covered too:
-/// LBRR frames were written with CODE_INDEPENDENTLY_NO_LTP_SCALING while
-/// every decoder reads CODE_INDEPENDENTLY, so each voiced LBRR frame desynced
-/// the main frame after it, regardless of channel count.
-fn check_fec_decodes_in_libopus(ch: usize) {
-    let plain = rust_enc_c_dec(ch, 20, false, false);
-    let fec = rust_enc_c_dec(ch, 20, true, false);
-    let (plain_worst, worst, lbrr_worst) = (min(&plain.normal), min(&fec.normal), min(&fec.lbrr));
+/// Both VBR and CBR are checked (issue #36: CBR used to drop LBRR entirely
+/// because the copied payload was as expensive as the main frame; a real
+/// low-rate LBRR payload fits under CBR, as in libopus).
+///
+/// The recovery metric is the *median* per-window SNR plus the fraction of
+/// windows above 2 dB — not the worst window: the speech-activity gate makes
+/// the encoder skip LBRR in quiet stretches, and libopus's own encoder does
+/// the same. Measured against libopus 1.3.1 with the same signal and settings
+/// (issue #36 work): VBR mono median 6.1 dB / worst 0.2 dB, CBR mono 4.6/0.2 —
+/// a missing LBRR section decodes as PLC, scoring ~0 dB.
+fn check_fec_decodes_in_libopus(ch: usize, cbr: bool) {
+    let plain = rust_enc_c_dec(ch, 20, false, cbr);
+    let fec = rust_enc_c_dec(ch, 20, true, cbr);
+    let (plain_worst, worst) = (min(&plain.normal), min(&fec.normal));
+    let lbrr_median = {
+        let mut v = fec.lbrr.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let above2 = fec
+        .lbrr
+        .iter()
+        .filter(|s| **s > 2.0)
+        .count();
     println!(
-        "opus-rs enc 20 ms {ch}ch + FEC -> libopus: normal {worst:.1} dB \
-         (no-FEC {plain_worst:.1} dB), LBRR {lbrr_worst:.1} dB; opus-rs vs libopus {:.1} dB",
-        min(&fec.agreement)
+        "opus-rs enc 20 ms {ch}ch + FEC({}) -> libopus: normal {worst:.1} dB \
+         (no-FEC {plain_worst:.1} dB), LBRR median {lbrr_median:.1} dB, {above2}/{} windows > 2 dB",
+        if cbr { "CBR" } else { "VBR" },
+        fec.lbrr.len()
     );
+    if cbr {
+        // CBR + FEC is a genuinely squeezed regime: when LBRR + main frame
+        // exceed the packet, both opus-rs and libopus degrade the packet
+        // (libopus emits 30-36 fallback packets per 50 here), and the main
+        // frame can land on its minimal damage-control encode. Judge the
+        // normal decode by the fraction of healthy windows; libopus's own
+        // CBR+FEC stream measures worst 4.5 dB / 47 of 47 windows > 2 dB.
+        let healthy = fec.normal.iter().filter(|s| **s > 2.0).count();
+        assert!(
+            healthy as f64 >= 0.75 * fec.normal.len() as f64,
+            "{ch}ch CBR + FEC: too many degraded main-frame windows ({healthy}/{}); \
+             per-window SNR: {:.1?}",
+            fec.normal.len(),
+            fec.normal
+        );
+        assert!(
+            lbrr_median > 2.0,
+            "{ch}ch CBR FEC: LBRR recovery too weak (median {lbrr_median:.1} dB < 2.0); \
+             per-window SNR: {:.1?}",
+            fec.lbrr
+        );
+        let frac = if ch == 1 { 0.60 } else { 0.35 };
+        assert!(
+            above2 as f64 >= frac * fec.lbrr.len() as f64,
+            "{ch}ch CBR FEC: too few windows with real LBRR recovery ({above2}/{} < \
+             {:.0}%); per-window SNR: {:.1?}",
+            fec.lbrr.len(),
+            frac * 100.0,
+            fec.lbrr
+        );
+        println!(
+            "opus-rs enc 20 ms {ch}ch + FEC(CBR) -> libopus: normal {worst:.1} dB \
+             (no-FEC {plain_worst:.1} dB), LBRR median {lbrr_median:.1} dB, {above2}/{} \
+             windows > 2 dB, agreement {:.1} dB",
+            fec.lbrr.len(),
+            min(&fec.agreement)
+        );
+        return;
+    }
     assert!(
         worst > INPUT_FLOOR_DB && worst > plain_worst - 1.0,
         "{ch}ch + FEC: normal decode desynced in libopus; per-window SNR: {:.1?}",
         fec.normal
     );
+    // Recovery floors, anchored below the measured opus-rs values with margin.
+    // opus-rs measures: VBR mono 4.0 median / 40 of 47 windows; stereo
+    // mid-only recovery behaves like libopus's own stereo FEC on equal
+    // content (libopus L=R reference: median 0.6 dB).
+    let (median_floor, frac) = if ch == 1 { (3.0, 0.70) } else { (1.0, 0.30) };
     assert!(
-        lbrr_worst > LBRR_FLOOR_DB,
-        "{ch}ch + FEC: LBRR missing or desynced in libopus; per-window SNR: {:.1?}",
+        lbrr_median > median_floor,
+        "{ch}ch {} FEC: LBRR recovery too weak (median {lbrr_median:.1} dB < \
+         {median_floor}); per-window SNR: {:.1?}",
+        if cbr { "CBR" } else { "VBR" },
+        fec.lbrr
+    );
+    assert!(
+        above2 as f64 >= frac * fec.lbrr.len() as f64,
+        "{ch}ch {} FEC: too few windows with real LBRR recovery ({above2}/{} < {:.0}%); \
+         per-window SNR: {:.1?}",
+        if cbr { "CBR" } else { "VBR" },
+        fec.lbrr.len(),
+        frac * 100.0,
         fec.lbrr
     );
     assert!(
@@ -385,17 +456,22 @@ fn check_fec_decodes_in_libopus(ch: usize) {
     );
 }
 
-/// LBRR recovery floor. Measured worst windows: 2.8 dB mono, 1.6 dB stereo
-/// (the LBRR copy carries a raised gain); a missing LBRR section decodes to
-/// silence, exactly 0 dB.
-const LBRR_FLOOR_DB: f64 = 0.5;
-
 #[test]
 fn opus_rs_mono_fec_decodes_in_libopus() {
-    check_fec_decodes_in_libopus(1);
+    check_fec_decodes_in_libopus(1, false);
 }
 
 #[test]
 fn opus_rs_stereo_fec_decodes_in_libopus() {
-    check_fec_decodes_in_libopus(2);
+    check_fec_decodes_in_libopus(2, false);
+}
+
+#[test]
+fn opus_rs_mono_fec_cbr_decodes_in_libopus() {
+    check_fec_decodes_in_libopus(1, true);
+}
+
+#[test]
+fn opus_rs_stereo_fec_cbr_decodes_in_libopus() {
+    check_fec_decodes_in_libopus(2, true);
 }
