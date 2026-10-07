@@ -481,6 +481,20 @@ fn encode_lbrr_section(
     rc.tell() - start_bits
 }
 
+/// Bits frame `frame_idx` of a `tot_blocks`-frame packet may fill the packet
+/// up to (libopus enc_API.c). Capping the earlier frames keeps a share of the
+/// packet for the later ones; otherwise a 60 ms packet's first two frames can
+/// leave the last one less than even its no-pulse fallback costs, and the
+/// packet overflows.
+fn silk_frame_max_bits(max_bits: i32, tot_blocks: i32, frame_idx: i32) -> i32 {
+    match (tot_blocks, frame_idx) {
+        (2, 0) => max_bits * 3 / 5,
+        (3, 0) => max_bits * 2 / 5,
+        (3, 1) => max_bits * 3 / 4,
+        _ => max_bits,
+    }
+}
+
 pub fn silk_encode(
     ps_enc: &mut SilkEncoderState,
     samples_in: &[i16],
@@ -668,12 +682,8 @@ pub fn silk_encode(
             CODE_CONDITIONALLY
         };
 
-        let frame_max_bits = (if _tot_blocks == 2 && frame_idx == 0 {
-            max_bits * 3 / 5
-        } else {
-            max_bits
-        } - lbrr_bits_reserved)
-            .max(48);
+        let frame_max_bits =
+            (silk_frame_max_bits(max_bits, _tot_blocks, frame_idx) - lbrr_bits_reserved).max(48);
 
         let mut frame_bytes = 0i32;
         let ret = silk_encode_frame(
