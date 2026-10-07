@@ -360,9 +360,9 @@ impl OpusEncoder {
 
         let mode = modes::default_mode();
         #[cfg(feature = "heap")]
-        let celt_enc = Box::new(CeltEncoder::new(mode, channels));
+        let celt_enc = Box::new(CeltEncoder::with_sampling_rate(mode, channels, sampling_rate));
         #[cfg(not(feature = "heap"))]
-        let celt_enc = CeltEncoder::new(mode, channels);
+        let celt_enc = CeltEncoder::with_sampling_rate(mode, channels, sampling_rate);
 
         #[cfg(feature = "heap")]
         let mut silk_enc = Box::new(SilkEncoderState::default());
@@ -947,6 +947,15 @@ impl OpusEncoder {
         if mode == OpusMode::CeltOnly || mode == OpusMode::Hybrid {
             self.celt_enc.complexity = self.complexity;
             let start_band = if mode == OpusMode::Hybrid { 17 } else { 0 };
+            // libopus `CELT_SET_END_BAND`: match the TOC bandwidth so the
+            // decoder reads the same number of coded bands (issue #37).
+            let end_band = match self.bandwidth {
+                Bandwidth::Narrowband => 13,
+                Bandwidth::Mediumband | Bandwidth::Wideband => 17,
+                Bandwidth::Superwideband => 19,
+                Bandwidth::Fullband | Bandwidth::Auto => 21,
+            };
+            self.celt_enc.set_end_band(end_band);
             let total_packet_bits = ((n_bytes - 1) * 8) as i32;
             // Propagate bitrate/VBR to CeltEncoder for accurate VBR handling (libopus parity)
             let celt_bitrate = if mode == OpusMode::Hybrid {

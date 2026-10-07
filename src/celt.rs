@@ -177,6 +177,23 @@ fn resampling_factor(sampling_rate: i32) -> usize {
     }
 }
 
+/// libopus `compute_mdcts` with `upsample != 1`: keep only the first
+/// `N/upsample` coefficients (the API Nyquist band), scale them by `upsample`
+/// to preserve energy after zero-stuffing, and zero the rest.
+fn upsample_scale_zero(freq: &mut [f32], frame_size: usize, upsample: usize, channels: usize) {
+    if upsample <= 1 {
+        return;
+    }
+    let bound = frame_size / upsample;
+    for c in 0..channels {
+        let base = c * frame_size;
+        for v in freq[base..base + bound].iter_mut() {
+            *v *= upsample as f32;
+        }
+        freq[base + bound..base + frame_size].fill(0.0);
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
 
@@ -1598,6 +1615,14 @@ const STRIDE_ACCESS_PAD: usize = crate::pvq::MAX_PVQ_N;
 pub struct CeltEncoder {
     mode: &'static CeltMode,
     channels: usize,
+    /// libopus `CELTEncoder.upsample`: the API input is zero-stuffed by this
+    /// factor so the encoder always works at the mode's 48 kHz geometry.
+    upsample: usize,
+    /// End band the packet is coded to, from the Opus bandwidth (libopus
+    /// `CELT_SET_END_BAND`): NB 13, MB/WB 17, SWB 19, FB 21. The decoder
+    /// derives the same value from the TOC, so coding even one band more
+    /// desynchronises the range coder (issue #37).
+    end_band: usize,
     pub complexity: i32,
     syn_mem: FixedVec<f32, CELT_SYN_MEM>,
     enc_decode_mem: FixedVec<f32, CELT_SYN_MEM>,
@@ -2083,6 +2108,18 @@ fn dynalloc_analysis_simple(
 
 impl CeltEncoder {
     pub fn new(mode: &'static CeltMode, channels: usize) -> Self {
+        Self::with_sampling_rate(mode, channels, 48000)
+    }
+
+    /// CELT encoder for `sampling_rate`, which need not be 48 kHz: the input
+    /// is zero-stuffed by `resampling_factor(sampling_rate)` so the mode's
+    /// 48 kHz geometry is used internally, exactly like libopus
+    /// (`celt_encoder.c` `st->upsample`).
+    pub fn with_sampling_rate(
+        mode: &'static CeltMode,
+        channels: usize,
+        sampling_rate: i32,
+    ) -> Self {
         // All internal buffers are sized for at most 2 channels; a larger
         // value would panic later inside `FixedVec::from_value` with an
         // unhelpful message (issue #27 deep scan).
@@ -2090,6 +2127,7 @@ impl CeltEncoder {
             (1..=2).contains(&channels),
             "CeltEncoder::new: channels must be 1 or 2 (got {channels})"
         );
+        let upsample = resampling_factor(sampling_rate);
         let overlap = mode.overlap;
         let channel_mem_size = 2048 + overlap;
         let syn_mem_size = channels * channel_mem_size;
@@ -2100,6 +2138,8 @@ impl CeltEncoder {
         Self {
             mode,
             channels,
+            upsample,
+            end_band: mode.nb_ebands,
             complexity: 9,
             syn_mem: FixedVec::from_value(0.0, syn_mem_size),
             enc_decode_mem: FixedVec::from_value(0.0, syn_mem_size),
@@ -2166,6 +2206,12 @@ impl CeltEncoder {
         }
     }
 
+    /// Set the highest coded band (`CELT_SET_END_BAND`). Must match the
+    /// bandwidth the packet's TOC signals.
+    pub fn set_end_band(&mut self, end: usize) {
+        self.end_band = end;
+    }
+
     pub fn encode(&mut self, pcm: &[f32], frame_size: usize, rc: &mut RangeCoder) {
         self.encode_impl(pcm, frame_size, rc, 0, None, false)
     }
@@ -2223,7 +2269,7 @@ impl CeltEncoder {
     fn encode_impl(
         &mut self,
         pcm: &[f32],
-        frame_size: usize,
+        api_frame_size: usize,
         rc: &mut RangeCoder,
         start_band: usize,
         explicit_total_bits: Option<i32>,
@@ -2231,7 +2277,11 @@ impl CeltEncoder {
     ) {
         let mode = self.mode;
         let channels = self.channels;
+        let upsample = self.upsample;
+        // Internal (48 kHz) frame size; `pcm` is at the API rate.
+        let frame_size = api_frame_size * upsample;
         let nb_ebands = mode.nb_ebands;
+        let end = self.end_band.clamp(1, nb_ebands).max(start_band);
         let overlap = mode.overlap;
 
         // The encoder geometry requires frame_size == short_mdct_size << lm
@@ -2270,8 +2320,15 @@ impl CeltEncoder {
 
             let mut m = self.preemph_mem[c];
             let coef = mode.preemph[0];
+            // Zero-stuff the API-rate input to 48 kHz (libopus celt_preemphasis
+            // with `upsample`), then run the pre-emphasis filter over all N
+            // internal samples.
             for i in 0..frame_size {
-                let x = pcm[c * frame_size + i] * 32768.0;
+                let x = if i % upsample == 0 {
+                    pcm[c * api_frame_size + i / upsample] * 32768.0
+                } else {
+                    0.0
+                };
                 let val = x - m;
                 self.syn_mem[channel_offset + syn_mem_size - frame_size + i] = val;
                 m = x * coef;
@@ -2382,10 +2439,13 @@ impl CeltEncoder {
         let error = &mut self.w_error[..nb_ebands * channels];
 
         // --- Silence detection (port of libopus celt_encoder.c: sample_max / overlap_max / lsb_depth) ---
+        // libopus measures sample/overlap maxima on the API-rate `pcm`:
+        // `(N-overlap)/upsample` and `overlap/upsample` samples.
+        let api_overlap = overlap / upsample;
         let mut sample_max = self.overlap_max;
-        let n_nonoverlap = frame_size.saturating_sub(overlap);
+        let n_nonoverlap = api_frame_size.saturating_sub(api_overlap);
         for c in 0..channels {
-            let base = c * frame_size;
+            let base = c * api_frame_size;
             for i in 0..n_nonoverlap {
                 let v = pcm[base + i].abs();
                 if v > sample_max {
@@ -2395,8 +2455,8 @@ impl CeltEncoder {
         }
         let mut new_overlap_max = 0.0f32;
         for c in 0..channels {
-            let base = c * frame_size;
-            for i in n_nonoverlap..frame_size {
+            let base = c * api_frame_size;
+            for i in n_nonoverlap..api_frame_size {
                 let v = pcm[base + i].abs();
                 if v > new_overlap_max {
                     new_overlap_max = v;
@@ -2489,12 +2549,13 @@ impl CeltEncoder {
                     1,
                 );
             }
+            upsample_scale_zero(freq, frame_size, upsample, channels);
             let band_e2 = &mut self.w_band_e2[..nb_ebands * channels];
-            compute_band_energies(mode, freq, band_e2, nb_ebands, channels, lm);
+            compute_band_energies(mode, freq, band_e2, end, channels, lm);
             let band_log_e2 = &mut self.w_band_log_e2[..nb_ebands * channels];
-            crate::bands::amp2log2(mode, 0, nb_ebands, band_e2, band_log_e2, channels);
+            crate::bands::amp2log2(mode, 0, end, band_e2, band_log_e2, channels);
             for c in 0..channels {
-                for i in 0..nb_ebands {
+                for i in 0..end {
                     band_log_e2[c * nb_ebands + i] += lm as f32 * 0.5;
                 }
             }
@@ -2515,18 +2576,19 @@ impl CeltEncoder {
                     );
                 }
             }
+            upsample_scale_zero(freq, frame_size, upsample, channels);
 
-            compute_band_energies(mode, freq, band_e, nb_ebands, channels, lm);
+            compute_band_energies(mode, freq, band_e, end, channels, lm);
             normalise_bands(
                 mode,
                 freq,
                 x,
                 band_e,
-                nb_ebands,
+                end,
                 channels,
                 (1 << lm) as usize,
             );
-            crate::bands::amp2log2(mode, start_band, nb_ebands, band_e, band_log_e, channels);
+            crate::bands::amp2log2(mode, start_band, end, band_e, band_log_e, channels);
         } else {
             // Long MDCT (non-transient)
             for c in 0..channels {
@@ -2541,17 +2603,18 @@ impl CeltEncoder {
                     1,
                 );
             }
-            compute_band_energies(mode, freq, band_e, nb_ebands, channels, lm);
+            upsample_scale_zero(freq, frame_size, upsample, channels);
+            compute_band_energies(mode, freq, band_e, end, channels, lm);
             normalise_bands(
                 mode,
                 freq,
                 x,
                 band_e,
-                nb_ebands,
+                end,
                 channels,
                 (1 << lm) as usize,
             );
-            crate::bands::amp2log2(mode, start_band, nb_ebands, band_e, band_log_e, channels);
+            crate::bands::amp2log2(mode, start_band, end, band_e, band_log_e, channels);
         }
 
         // C uses st->force_intra (CTL flag, 0 by default) instead of the old
@@ -2559,8 +2622,8 @@ impl CeltEncoder {
         quant_coarse_energy_advanced(
             mode,
             start_band,
-            nb_ebands,
-            nb_ebands,
+            end,
+            end,
             band_log_e,
             &mut self.old_band_e,
             total_bits as u32,
@@ -2608,7 +2671,7 @@ impl CeltEncoder {
             band_log_e2_opt,
             &self.old_band_e,
             start_band,
-            nb_ebands,
+            end,
             channels,
             lm,
             effective_bytes,
@@ -2628,7 +2691,7 @@ impl CeltEncoder {
         let tf_select = if self.complexity >= 2 && effective_bytes >= 15 * channels {
             tf_analysis(
                 mode,
-                nb_ebands,
+                end,
                 is_transient,
                 tf_res,
                 lambda,
@@ -2644,7 +2707,7 @@ impl CeltEncoder {
         };
         tf_encode(
             start_band,
-            nb_ebands,
+            end,
             is_transient,
             tf_res,
             lm as i32,
@@ -2667,7 +2730,7 @@ impl CeltEncoder {
                 &INTEN_HYSTERESIS,
                 self.intensity,
             );
-            self.intensity = self.intensity.clamp(0, nb_ebands as i32);
+            self.intensity = self.intensity.clamp(0, end as i32);
         }
 
         if self.complexity == 0 {
@@ -2689,7 +2752,7 @@ impl CeltEncoder {
                     &mut self.hf_average,
                     &mut self.tapset_decision,
                     update_hf,
-                    nb_ebands,
+                    end,
                     channels,
                     (1 << lm) as usize,
                     &spread_weights,
@@ -2705,7 +2768,7 @@ impl CeltEncoder {
         let mut total_boost = 0i32;
         let mut tell_frac = rc.tell_frac();
 
-        for i in start_band..nb_ebands {
+        for i in start_band..end {
             let width =
                 channels as i32 * (mode.e_bands[i + 1] - mode.e_bands[i]) as i32 * (1 << lm);
             let quanta = (width << BITRES).min((6 << BITRES).max(width));
@@ -2738,7 +2801,7 @@ impl CeltEncoder {
             mode,
             x,
             band_log_e,
-            nb_ebands,
+            end,
             lm as i32,
             channels,
             frame_size,
@@ -2787,7 +2850,7 @@ impl CeltEncoder {
                 band_log_e,
                 nb_ebands,
                 channels,
-                nb_ebands,
+                end,
                 self.lsb_depth,
             );
             let mut target = if !hybrid {
@@ -2894,7 +2957,7 @@ impl CeltEncoder {
         self.last_coded_bands = clt_compute_allocation(
             mode,
             start_band,
-            nb_ebands,
+            end,
             offsets,
             cap,
             alloc_trim,
@@ -2916,7 +2979,7 @@ impl CeltEncoder {
         quant_fine_energy(
             mode,
             start_band,
-            nb_ebands,
+            end,
             &mut self.old_band_e,
             error,
             ebits,
@@ -2938,7 +3001,7 @@ impl CeltEncoder {
             true,
             mode,
             start_band,
-            nb_ebands,
+            end,
             x_split,
             y_opt,
             collapse_masks,
@@ -2971,7 +3034,7 @@ impl CeltEncoder {
         quant_energy_finalise(
             mode,
             start_band,
-            nb_ebands,
+            end,
             &mut self.old_band_e,
             error,
             ebits,
@@ -2989,7 +3052,7 @@ impl CeltEncoder {
 
         if resynth {
             let band_amp_synth = &mut self.w_band_amp_synth[..nb_ebands * channels];
-            log2amp(mode, nb_ebands, band_amp_synth, &self.old_band_e, channels);
+            log2amp(mode, end, band_amp_synth, &self.old_band_e, channels);
             // `w_freq` is no longer needed after analysis/quant; reuse it as the
             // synthesis scratch (avoids a separate `w_freq_synth` buffer).
             self.w_freq[..frame_size * channels].fill(0.0);
@@ -3000,7 +3063,7 @@ impl CeltEncoder {
                 freq_synth,
                 band_amp_synth,
                 start_band,
-                nb_ebands,
+                end,
                 channels,
                 (1 << lm) as usize,
             );
