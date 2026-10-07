@@ -676,16 +676,6 @@ pub fn silk_encode(
             continue;
         }
 
-        let input_delay: usize = match fs_in_khz {
-            8 => 6,
-            12 => 7,
-            16 => 10,
-            24 => 6,
-            48 => 12,
-            _ => 0,
-        };
-        let n_samp: usize = fs_in_khz - input_delay;
-
         let n = raw_frame.len();
 
         if n > MAX_FRAME_LENGTH {
@@ -693,24 +683,11 @@ pub fn silk_encode(
             continue;
         }
 
+        // The API-rate -> internal-rate conversion (with its delay_matrix_enc
+        // input delay) is done by the caller's encoder resampler; frames
+        // arrive here at the internal rate.
         let mut resampler_out = [0i16; MAX_FRAME_LENGTH];
-
-        let mut delay_buf = ps_enc.resampler_delay_buf;
-        delay_buf[input_delay..fs_in_khz].copy_from_slice(&raw_frame[..n_samp]);
-
-        resampler_out[..fs_in_khz].copy_from_slice(&delay_buf[..fs_in_khz]);
-
-        let rest_len = n - fs_in_khz;
-        let rest_end = n_samp + rest_len;
-
-        if rest_end <= raw_frame.len() && n <= MAX_FRAME_LENGTH {
-            resampler_out[fs_in_khz..n].copy_from_slice(&raw_frame[n_samp..rest_end]);
-        }
-
-        if n >= input_delay {
-            delay_buf[..input_delay].copy_from_slice(&raw_frame[n - input_delay..]);
-        }
-        ps_enc.resampler_delay_buf = delay_buf;
+        resampler_out[..n].copy_from_slice(raw_frame);
 
         let mut input_buf = [0i16; MAX_FRAME_LENGTH + 2];
         input_buf[0] = ps_enc.stereo.s_mid[0];
