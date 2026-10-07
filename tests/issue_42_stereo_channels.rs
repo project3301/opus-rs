@@ -10,12 +10,11 @@
 //! - Hybrid fed SILK the interleaved L,R,L,R… input as if it were mono, so at
 //!   24/48 kHz even the mid was garbage.
 //!
-//! opus-rs codes stereo SILK as mid only, so the bar is correct mono in both
-//! channels, close to what libopus's own encoder achieves with real side
-//! coding. Each config encodes the same signal with opus-rs and with libopus
-//! at the same settings, decodes both with libopus, and measures each decoded
-//! channel against the input. The opus-rs decoder must also agree with
-//! libopus on opus-rs's packets.
+//! Each config encodes the same signal with opus-rs and with libopus at the
+//! same settings, decodes both with libopus, and measures each decoded
+//! channel against the input: its gain against the input mid must match
+//! libopus's, and its SNR come close. The opus-rs decoder must also agree
+//! with libopus on opus-rs's packets.
 
 use opus::{
     Application as CApp, Bandwidth as CBw, Bitrate as CBitrate, Channels as CCh, Decoder as CDec,
@@ -239,6 +238,10 @@ fn run(cfg: &Config) -> Measured {
     }
 }
 
+/// How far each decoded channel's gain against the input mid may stray from
+/// libopus's. The stereo predictor carries the L/R balance: with the mid
+/// alone both channels decoded at +0.85·mid, against libopus's +0.93 / +0.75.
+const GAIN_MARGIN: f64 = 0.08;
 /// How far below libopus's per-channel SNR opus-rs may fall. Coding the mid
 /// only costs the channel whose shape differs most from the mid; measured
 /// about 1.3 dB on R here.
@@ -265,9 +268,8 @@ fn check(cfg: Config) {
 
     for (c, name) in ["L", "R"].iter().enumerate() {
         assert!(
-            (0.6..=1.2).contains(&m.rs.gain[c]),
-            "{}: decoded {name} = {:+.2}·mid, expected the mid in both channels \
-             (libopus: {:+.2}·mid)",
+            (m.rs.gain[c] - m.c.gain[c]).abs() <= GAIN_MARGIN,
+            "{}: decoded {name} = {:+.2}·mid, libopus {:+.2}·mid",
             cfg.name,
             m.rs.gain[c],
             m.c.gain[c]

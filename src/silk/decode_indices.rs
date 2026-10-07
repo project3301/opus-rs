@@ -108,13 +108,6 @@ pub fn silk_decode_indices(
     ps_dec.indices.seed = ps_range_dec.decode_icdf(&SILK_UNIFORM4_ICDF, 8) as i8;
 }
 
-/// Half a predictor sub-step, `SILK_FIX_CONST(0.5 / STEREO_QUANT_SUB_STEPS, 16)`
-/// in libopus (stereo_decode_pred.c, stereo_quant_pred.c). SILK_FIX_CONST
-/// rounds, so this is 6554, not the 6553 of `(1 << 16) / 10`; the truncated
-/// value dequantized 45 of the 75 predictor levels a few Q13 units off
-/// libopus, and the neutral index to (0, -5) instead of (0, 0).
-const STEREO_HALF_SUB_STEP_Q16: i32 = 6554;
-
 pub fn silk_stereo_decode_pred(ps_range_dec: &mut RangeCoder) -> [i32; 2] {
     let mut pred_q13 = [0i32; 2];
 
