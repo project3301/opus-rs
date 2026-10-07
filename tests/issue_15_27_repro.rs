@@ -205,12 +205,18 @@ fn issue_27_2a_stereo_40ms_roundtrip_both_frames_consistent() {
 
 /// With in-band FEC enabled, the decoder's LBRR skip path expects a stereo
 /// header before every LBRR payload; the encoder used to write none, so any
-/// stereo packet carrying LBRR desynced immediately. The LBRR section must
-/// also gracefully degrade when it does not fit the packet budget.
+/// stereo packet carrying LBRR desynced immediately.
 ///
-/// At CBR the LBRR section never fits, so this covers the budget fallback;
-/// `issue_27_libopus_oracle.rs` uses VBR to check the LBRR payloads
-/// themselves against libopus.
+/// Until issue #36 the LBRR section never fit at CBR, so this test only ever
+/// covered the budget fallback. Now most packets carry it, and the main frame
+/// pays for it: at 24 kbps some packets keep well under half the bits, and
+/// this signal (a 440 Hz burst restarted every packet) then decodes at 3 dB
+/// where it scored 26 dB alone. libopus's encoder does the same at these
+/// settings (its worst packets: 2.6 and 5.9 dB), so the per-packet bar only
+/// guards against a desync, which decodes to noise; the mean keeps the bar the
+/// test used to apply to every packet (opus-rs and libopus both average
+/// 14.5 dB). `issue_27_libopus_oracle.rs` checks the LBRR payloads themselves
+/// against libopus.
 #[test]
 fn issue_27_2b_stereo_fec_roundtrip_consistent() {
     let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
@@ -221,12 +227,25 @@ fn issue_27_2b_stereo_fec_roundtrip_consistent() {
     let frame = 320; // 20 ms
 
     let mut dec = OpusDecoder::new(16000, 2).unwrap();
+    let (mut snr_sum, mut lbrr_packets) = (0.0, 0);
     for pkt_idx in 0..8 {
         let input = sine_input(frame, 16000, 2);
         let mut pkt = vec![0u8; 1500];
         let n = enc
             .encode(&input, frame, &mut pkt)
             .unwrap_or_else(|e| panic!("packet {pkt_idx}: encode failed: {e}"));
+        // The SILK header's flags (mid VAD, mid LBRR, ...) sit in the top bits
+        // of the frame's first byte: right after the TOC, or, when CBR pads
+        // the packet with code 3, after the frame count and the (short)
+        // padding length.
+        let silk = match pkt[0] & 3 {
+            0 => 1,
+            3 if pkt[1] & 0x40 != 0 => 3,
+            3 => 2,
+            code => panic!("packet {pkt_idx}: unexpected code {code}"),
+        };
+        lbrr_packets += ((pkt[silk] >> 6) & 1) as usize;
+
         let mut pcm = vec![0.0f32; frame * 2];
         let samples = dec
             .decode(&pkt[..n], frame, &mut pcm)
@@ -235,10 +254,17 @@ fn issue_27_2b_stereo_fec_roundtrip_consistent() {
 
         let (snr_first, snr_second) = half_snrs(&pcm, &input, samples, 2);
         assert!(
-            snr_first > 8.0 && snr_second > 8.0,
+            snr_first > 1.0 && snr_second > 1.0,
             "packet {pkt_idx}: LBRR stereo desync — snr_first={snr_first:.1} dB, snr_second={snr_second:.1} dB"
         );
+        snr_sum += snr_first + snr_second;
     }
+    assert!(
+        lbrr_packets >= 4,
+        "only {lbrr_packets}/8 packets carry LBRR; the stereo LBRR path goes untested"
+    );
+    let mean = snr_sum / 16.0;
+    assert!(mean > 8.0, "mean SNR {mean:.1} dB");
 }
 
 // ---------------------------------------------------------------------------

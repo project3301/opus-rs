@@ -9,6 +9,9 @@ pub const NB_SPEECH_FRAMES_BEFORE_DTX: i32 = 10;
 pub const MAX_CONSECUTIVE_DTX: i32 = 20;
 
 pub const SPEECH_ACTIVITY_DTX_THRES_Q8: i32 = 13;
+/// `SILK_FIX_CONST(LBRR_SPEECH_ACTIVITY_THRES, 8)`: frames at or below this
+/// speech activity get no LBRR copy.
+pub const LBRR_SPEECH_ACTIVITY_THRES_Q8: i32 = 77;
 
 pub const MIN_TARGET_RATE_BPS: i32 = 5000;
 pub const MAX_TARGET_RATE_BPS: i32 = 80000;

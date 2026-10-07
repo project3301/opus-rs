@@ -162,6 +162,31 @@ fn silk_voip_fec_parity_stereo_and_mono() {
 }
 
 #[test]
+fn silk_voip_cbr_fec_parity() {
+    // At CBR the LBRR section is now present (issue #36): the requantized
+    // LBRR frames and the budget they take must match across entry points,
+    // with both quantizers (complexity 0: plain NSQ, 10: delayed decision)
+    // and in multi-frame packets.
+    for &channels in &[1usize, 2] {
+        for &complexity in &[0, 10] {
+            for &frame_ms in &[20usize, 40, 60] {
+                let cfg = EncConfig {
+                    fs: 16000,
+                    channels,
+                    app: Application::Voip,
+                    bitrate: 32000,
+                    complexity,
+                    use_cbr: true,
+                    fec: true,
+                    loss: 40,
+                };
+                assert_parity(&cfg, 16 * frame_ms, 8);
+            }
+        }
+    }
+}
+
+#[test]
 fn hybrid_parity_24k_and_48k() {
     // 24 kHz defaults to Superwideband -> forced Hybrid.
     let cfg24 = EncConfig {

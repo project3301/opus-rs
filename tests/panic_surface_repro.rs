@@ -282,3 +282,81 @@ fn p2_encoder_extreme_fields_no_panic() {
     let res2 = enc2.encode(&input, 960, &mut pkt);
     assert!(res2.is_ok(), "encode with extreme fields must not panic");
 }
+
+/// In-band FEC must not break an encoder configuration that works without it,
+/// nor panic. Issue #36: once the LBRR section started fitting at CBR, 40 ms
+/// CBR packets overflowed their budget, because the LBRR bits were charged
+/// against the frames twice, and 60 ms packets overflowed because the last
+/// frame had no share of its own. Sweeps SILK-only (10-60 ms) and Hybrid
+/// (10/20 ms) rates, mono and stereo, CBR and VBR, with a roomy and a tight
+/// output buffer.
+///
+/// Configurations that fail without FEC are skipped: below about 10 kbps,
+/// 10 ms CBR packets are smaller than the cheapest SILK frame and overflow
+/// either way, and 48 kHz CBR at the 500 bps minimum trips the
+/// `RangeCoder::shrink` debug assertion either way.
+#[test]
+fn p2_fec_never_breaks_a_working_configuration() {
+    fn encode_all(
+        sr: usize,
+        ch: usize,
+        ms: usize,
+        cbr: bool,
+        bitrate: i32,
+        buf: usize,
+        fec: bool,
+    ) -> Result<(), String> {
+        let frame = sr * ms / 1000;
+        let mut enc = OpusEncoder::new(sr as i32, ch, Application::Voip).unwrap();
+        enc.bitrate_bps = bitrate;
+        enc.use_cbr = cbr;
+        enc.use_inband_fec = fec;
+        enc.packet_loss_perc = 40;
+        let mut pkt = vec![0u8; buf];
+        let (mut lcg, mut phase) = (0x1357_9bdfu32, 0f32);
+        for p in 0..6 {
+            let x: Vec<f32> = (0..frame * ch)
+                .map(|_| {
+                    lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    phase += 2.0 * PI * 150.0 / (sr * ch) as f32;
+                    0.4 * phase.sin() + 0.1 * ((lcg >> 9) as f32 / 8_388_608.0 - 1.0)
+                })
+                .collect();
+            enc.encode(&x, frame, &mut pkt)
+                .map_err(|e| format!("packet {p}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    for &sr in &[8000usize, 16000, 48000] {
+        for &ch in &[1usize, 2] {
+            // 40/60 ms Hybrid is the 20 ms path repacketized (issue #35).
+            let durations: &[usize] = if sr == 48000 {
+                &[10, 20]
+            } else {
+                &[10, 20, 40, 60]
+            };
+            for &ms in durations {
+                for &cbr in &[true, false] {
+                    for &bitrate in &[500, 8000, 16000, 32000, 64000] {
+                        for &buf in &[1500usize, 60] {
+                            let plain = std::panic::catch_unwind(|| {
+                                encode_all(sr, ch, ms, cbr, bitrate, buf, false)
+                            });
+                            if !matches!(plain, Ok(Ok(()))) {
+                                continue;
+                            }
+                            if let Err(e) = encode_all(sr, ch, ms, cbr, bitrate, buf, true) {
+                                panic!(
+                                    "{sr} Hz {ch}ch {ms} ms {} {bitrate} bps, {buf}-byte buffer: \
+                                     encodes without FEC, fails with it: {e}",
+                                    if cbr { "CBR" } else { "VBR" }
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

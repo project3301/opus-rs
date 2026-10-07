@@ -31,7 +31,7 @@ use crate::fixedvec::FixedVec;
 pub use celt::{CeltDecoder, CeltEncoder};
 use hp_cutoff::{dc_reject_float, hp_cutoff, hp_cutoff_float, hp_cutoff_i16};
 use range_coder::RangeCoder;
-use silk::control_codec::silk_control_encoder;
+use silk::control_codec::{silk_control_encoder, silk_setup_lbrr};
 use silk::enc_api::silk_encode;
 use silk::init_encoder::silk_init_encoder;
 use silk::lin2log::silk_lin2log;
@@ -252,33 +252,31 @@ fn compute_mode_threshold(
     threshold
 }
 
-fn compute_silk_rate_for_hybrid(rate_bps: i32, frame20ms: bool) -> i32 {
-    const RATE_TABLE: &[(i32, i32, i32)] = &[
-        (0, 0, 0),
-        (12000, 10000, 10000),
-        (16000, 13500, 13500),
-        (20000, 16000, 16000),
-        (24000, 18000, 18000),
-        (32000, 22000, 22000),
-        (64000, 38000, 38000),
+/// SILK's share of a Hybrid bitrate (libopus `compute_silk_rate_for_hybrid`).
+/// With in-band FEC SILK gets more, since its LBRR section comes out of its
+/// own target rate.
+fn compute_silk_rate_for_hybrid(rate_bps: i32, frame20ms: bool, fec: bool) -> i32 {
+    // total, then SILK at 10 ms / 20 ms without FEC, and at 10 ms / 20 ms with FEC
+    const RATE_TABLE: &[[i32; 5]] = &[
+        [0, 0, 0, 0, 0],
+        [12000, 10000, 10000, 11000, 11000],
+        [16000, 13500, 13500, 15000, 15000],
+        [20000, 16000, 16000, 18000, 18000],
+        [24000, 18000, 18000, 21000, 21000],
+        [32000, 22000, 22000, 28000, 28000],
+        [64000, 38000, 38000, 50000, 50000],
     ];
+    let entry = 1 + frame20ms as usize + 2 * fec as usize;
     let n = RATE_TABLE.len();
     let mut i = 1;
-    while i < n && RATE_TABLE[i].0 <= rate_bps {
+    while i < n && RATE_TABLE[i][0] <= rate_bps {
         i += 1;
     }
     if i == n {
-        let (x_last, r10_last, r20_last) = RATE_TABLE[n - 1];
-        let base = if frame20ms { r20_last } else { r10_last };
-        base + (rate_bps - x_last) / 2
+        RATE_TABLE[n - 1][entry] + (rate_bps - RATE_TABLE[n - 1][0]) / 2
     } else {
-        let (x0, lo10, lo20) = RATE_TABLE[i - 1];
-        let (x1, hi10, hi20) = RATE_TABLE[i];
-        let (lo, hi) = if frame20ms {
-            (lo20, hi20)
-        } else {
-            (lo10, hi10)
-        };
+        let (x0, lo) = (RATE_TABLE[i - 1][0], RATE_TABLE[i - 1][entry]);
+        let (x1, hi) = (RATE_TABLE[i][0], RATE_TABLE[i][entry]);
         (lo * (x1 - rate_bps) + hi * (rate_bps - x0)) / (x1 - x0)
     }
 }
@@ -289,28 +287,38 @@ mod silk_rate_tests {
 
     #[test]
     fn test_reference_table_exact_entries() {
-        assert_eq!(compute_silk_rate_for_hybrid(12000, true), 10000);
-        assert_eq!(compute_silk_rate_for_hybrid(16000, true), 13500);
-        assert_eq!(compute_silk_rate_for_hybrid(20000, true), 16000);
-        assert_eq!(compute_silk_rate_for_hybrid(24000, true), 18000);
-        assert_eq!(compute_silk_rate_for_hybrid(32000, true), 22000);
-        assert_eq!(compute_silk_rate_for_hybrid(64000, true), 38000);
+        assert_eq!(compute_silk_rate_for_hybrid(12000, true, false), 10000);
+        assert_eq!(compute_silk_rate_for_hybrid(16000, true, false), 13500);
+        assert_eq!(compute_silk_rate_for_hybrid(20000, true, false), 16000);
+        assert_eq!(compute_silk_rate_for_hybrid(24000, true, false), 18000);
+        assert_eq!(compute_silk_rate_for_hybrid(32000, true, false), 22000);
+        assert_eq!(compute_silk_rate_for_hybrid(64000, true, false), 38000);
     }
 
     #[test]
     fn test_32kbps_gives_22kbps_silk() {
-        assert_eq!(compute_silk_rate_for_hybrid(32000, true), 22000);
+        assert_eq!(compute_silk_rate_for_hybrid(32000, true, false), 22000);
     }
 
     #[test]
     fn test_interpolation_between_table_entries() {
-        let r = compute_silk_rate_for_hybrid(18000, true);
+        let r = compute_silk_rate_for_hybrid(18000, true, false);
         assert_eq!(r, 14750);
     }
 
     #[test]
+    fn test_fec_gives_silk_more() {
+        assert_eq!(compute_silk_rate_for_hybrid(32000, true, true), 28000);
+        assert_eq!(compute_silk_rate_for_hybrid(18000, false, true), 16500);
+        assert_eq!(
+            compute_silk_rate_for_hybrid(72000, true, true),
+            50000 + 4000
+        );
+    }
+
+    #[test]
     fn test_above_table_max_gives_half_extra() {
-        let r = compute_silk_rate_for_hybrid(72000, true);
+        let r = compute_silk_rate_for_hybrid(72000, true, false);
         assert_eq!(r, 38000 + (72000 - 64000) / 2);
     }
 }
@@ -650,6 +658,11 @@ impl OpusEncoder {
         let toc = gen_toc(mode, frame_rate, self.bandwidth, self.channels);
         output[0] = toc;
 
+        // In-band FEC needs a loss rate to protect against (the first test in
+        // libopus `decide_fec`; its rate thresholds need the bandwidth
+        // switching this port does not do).
+        let lbrr_coded = self.use_inband_fec && self.packet_loss_perc > 0;
+
         let target_bits =
             (self.bitrate_bps as i64 * frame_size as i64 / self.sampling_rate as i64) as i32;
         let cbr_bytes = ((target_bits + 4) / 8) as usize;
@@ -718,11 +731,12 @@ impl OpusEncoder {
 
             self.silk_enc.s_cmn.use_in_band_fec = if self.use_inband_fec { 1 } else { 0 };
             self.silk_enc.s_cmn.packet_loss_perc = self.packet_loss_perc.clamp(0, 100);
-
-            self.silk_enc.s_cmn.lbrr_enabled = if self.use_inband_fec { 1 } else { 0 };
-
-            if self.silk_enc.s_cmn.lbrr_gain_increases == 0 {
-                self.silk_enc.s_cmn.lbrr_gain_increases = 2;
+            silk_setup_lbrr(&mut self.silk_enc.s_cmn, lbrr_coded);
+            // libopus re-initialises SILK on a switch from CELT. This port keeps
+            // the SILK state, so at least drop LBRR copies of frames coded
+            // before the CELT stretch.
+            if self.prev_enc_mode == Some(OpusMode::CeltOnly) {
+                self.silk_enc.s_cmn.lbrr_flags = [0; silk::define::MAX_FRAMES_PER_PACKET];
             }
 
             let required_size = frame_size * self.channels;
@@ -861,7 +875,7 @@ impl OpusEncoder {
             let silk_bitrate = if mode == OpusMode::Hybrid {
                 let frame_duration_ms = frame_size as i32 * 1000 / self.sampling_rate;
                 let frame20ms = frame_duration_ms >= 20;
-                compute_silk_rate_for_hybrid(self.bitrate_bps, frame20ms)
+                compute_silk_rate_for_hybrid(self.bitrate_bps, frame20ms, lbrr_coded)
             } else {
                 (8i64 * (n_bytes - 1) as i64 * silk_rate_for_calc as i64 / silk_frame_len as i64)
                     as i32
@@ -879,6 +893,7 @@ impl OpusEncoder {
                     let max_bit_rate = compute_silk_rate_for_hybrid(
                         total_max_bits * self.sampling_rate / frame_size as i32,
                         frame20ms,
+                        lbrr_coded,
                     );
                     max_bit_rate * frame_size as i32 / self.sampling_rate
                 }
@@ -961,7 +976,8 @@ impl OpusEncoder {
             let celt_bitrate = if mode == OpusMode::Hybrid {
                 let frame_ms = frame_size as i32 * 1000 / self.sampling_rate;
                 let frame20ms = frame_ms >= 20;
-                let silk_rate = compute_silk_rate_for_hybrid(self.bitrate_bps, frame20ms);
+                let silk_rate =
+                    compute_silk_rate_for_hybrid(self.bitrate_bps, frame20ms, lbrr_coded);
                 (self.bitrate_bps - silk_rate).max(8000)
             } else {
                 self.bitrate_bps

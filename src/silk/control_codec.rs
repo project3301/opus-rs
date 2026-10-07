@@ -1,4 +1,5 @@
 use crate::silk::define::*;
+use crate::silk::macros::silk_smulwb;
 use crate::silk::structs::*;
 use crate::silk::tables_nlsf::*;
 
@@ -143,6 +144,23 @@ pub fn silk_setup_complexity(ps_enc: &mut SilkEncoderState, complexity: i32) -> 
     cmn.complexity = complexity;
 
     SILK_NO_ERROR
+}
+
+/// Turn in-band LBRR on or off for the next packet and choose how far its
+/// gains are raised (libopus 1.5+ `silk_setup_LBRR`). The first packet with
+/// LBRR follows packets that spent every bit on the main frame, so it raises
+/// gains furthest; after that, higher packet loss buys a finer LBRR.
+pub fn silk_setup_lbrr(cmn: &mut SilkEncoderStateCommon, lbrr_coded: bool) {
+    let lbrr_in_previous_packet = cmn.lbrr_enabled != 0;
+    cmn.lbrr_enabled = lbrr_coded as i32;
+    if lbrr_coded {
+        cmn.lbrr_gain_increases = if lbrr_in_previous_packet {
+            // SILK_FIX_CONST(0.2, 16)
+            (7 - silk_smulwb(cmn.packet_loss_perc, 13107)).max(3)
+        } else {
+            7
+        };
+    }
 }
 
 pub fn silk_control_encoder(

@@ -156,7 +156,26 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
   `resampling_factor(Fs)` and scales/zeroes the MDCT output for non-48 kHz
   rates, as libopus `celt_preemphasis` / `compute_mdcts` do. 24 kHz `Audio`
   now matches libopus (per-window correlation ~1.0, was ~0.04).
-- **Tests:** new libopus-oracle suites for SILK multi-frame/FEC (#27),
+- **Fix: in-band FEC sent no LBRR at CBR (issue #36).** The LBRR copy reused
+  the main frame's pulses with only its first gain index raised, so it cost
+  as much as the main frame: at CBR it never fit the packet, and at VBR the
+  recovered frame played about 2.5 dB loud. The encoder now ports libopus
+  `silk_LBRR_encode`: each active frame is quantized a second time, on a
+  scratch copy of the NSQ state, at gains raised by `silk_setup_LBRR`'s
+  increase (libopus 1.5+). Packet budgeting follows libopus too: the LBRR
+  section is charged once, to the first frame's target rate (smoothed over
+  packets), instead of twice against the frame budget; 60 ms packets cap
+  their first two frames (2/5 and 3/4), which only 40 ms did; and Hybrid
+  gives SILK libopus's larger FEC share. At 16 kHz, 32 kbps CBR and 40% loss,
+  libopus now recovers lost packets from opus-rs's LBRR as well as from its
+  own (5.5 dB against 5.6 dB, mono), with no extra cost to the normal
+  decode, and 40/60 ms CBR packets with FEC no longer overflow. Three
+  intended differences from libopus: LBRR gains are coded against the LBRR
+  frames' own history (libopus's copied indices can recover a frame 3 to
+  19 dB off); the 60 ms frame caps share what the LBRR section leaves rather
+  than the whole packet; and an LBRR section that would leave a frame less
+  than its cheapest coding is dropped rather than overflow the packet.
+- **Tests:** new libopus-oracle suites for SILK multi-frame/FEC (#27, #36),
   frame-loss concealment (#15), mono alignment (#34), 40/60 ms frames (#35)
   and 24 kHz encoding (#37).
 

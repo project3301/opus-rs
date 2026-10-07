@@ -95,3 +95,43 @@ fn construction_and_roundtrip_fit_in_768kb_stack() {
         "constructing + encoding + decoding overflowed a 768 KiB stack"
     );
 }
+
+/// The SILK path with in-band FEC must fit the same stack: since issue #36 the
+/// encoder quantizes every active frame twice, the second time (the LBRR copy)
+/// on a scratch copy of the noise-shaping quantizer's state. 60 ms stereo CBR
+/// at complexity 10 runs the delayed-decision quantizer on all three frames.
+#[cfg(feature = "heap")]
+#[test]
+fn silk_fec_roundtrip_fits_in_768kb_stack() {
+    let fits = std::thread::Builder::new()
+        .stack_size(768 * 1024)
+        .spawn(|| {
+            let mut enc = OpusEncoder::new(16000, 2, Application::Voip).unwrap();
+            enc.bitrate_bps = 32_000;
+            enc.use_cbr = true;
+            enc.complexity = 10;
+            enc.use_inband_fec = true;
+            enc.packet_loss_perc = 40;
+            let mut dec = OpusDecoder::new(16000, 2).unwrap();
+
+            let frame_size = 960; // 60 ms @ 16 kHz
+            let mut packet = vec![0u8; 1500];
+            let mut pcm = vec![0.0f32; frame_size * 2];
+            let mut decoded = 0;
+            for p in 0..4 {
+                let input: Vec<f32> = (0..frame_size * 2)
+                    .map(|i| {
+                        let t = (p * frame_size + i / 2) as f32 / 16000.0;
+                        0.4 * (2.0 * std::f32::consts::PI * 180.0 * t).sin()
+                    })
+                    .collect();
+                let n = enc.encode(&input, frame_size, &mut packet).unwrap();
+                decoded += dec.decode(&packet[..n], frame_size, &mut pcm).unwrap();
+            }
+            decoded
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(fits, 4 * 960);
+}

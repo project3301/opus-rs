@@ -104,6 +104,62 @@ pub fn silk_gains_dequant(
     }
 }
 
+/// The absolute gain level (index into the `N_LEVELS_QGAIN` table) of each
+/// subframe that `silk_gains_dequant` reconstructs from `ind`, starting from
+/// `prev_ind`.
+pub fn silk_gains_levels(
+    ind: &[i8; MAX_NB_SUBFR],
+    mut prev_ind: i8,
+    conditional: i32,
+    nb_subfr: usize,
+) -> [i8; MAX_NB_SUBFR] {
+    let mut levels = [0i8; MAX_NB_SUBFR];
+    let mut gain_q16 = [0i32; MAX_NB_SUBFR];
+    for k in 0..nb_subfr {
+        // Only subframe 0 can be coded independently; dequantize one subframe
+        // at a time and read the level off the running index.
+        let cond = if k == 0 { conditional } else { 1 };
+        silk_gains_dequant(&mut gain_q16, &[ind[k], 0, 0, 0], &mut prev_ind, cond, 1);
+        levels[k] = prev_ind;
+    }
+    levels
+}
+
+/// Gain indices that `silk_gains_dequant` turns into `levels`, starting from
+/// `prev_ind`, as closely as the delta range allows: `silk_gains_quant`'s
+/// index coding for targets that are already levels.
+pub fn silk_gains_encode_levels(
+    levels: &[i8; MAX_NB_SUBFR],
+    mut prev_ind: i8,
+    conditional: i32,
+    nb_subfr: usize,
+) -> [i8; MAX_NB_SUBFR] {
+    let mut ind = [0i8; MAX_NB_SUBFR];
+    for k in 0..nb_subfr {
+        let (level, prev) = (levels[k] as i32, prev_ind as i32);
+        let next = if k == 0 && conditional == 0 {
+            ind[k] = level as i8;
+            level.max(prev - 16)
+        } else {
+            let double_step_size_threshold = 2 * MAX_DELTA_GAIN_QUANT - N_LEVELS_QGAIN + prev;
+            let mut delta = level - prev;
+            if delta > double_step_size_threshold {
+                delta = double_step_size_threshold
+                    + silk_rshift(delta - double_step_size_threshold + 1, 1);
+            }
+            delta = silk_limit_int(delta, MIN_DELTA_GAIN_QUANT, MAX_DELTA_GAIN_QUANT);
+            ind[k] = (delta - MIN_DELTA_GAIN_QUANT) as i8;
+            if delta > double_step_size_threshold {
+                prev + silk_lshift(delta, 1) - double_step_size_threshold
+            } else {
+                prev + delta
+            }
+        };
+        prev_ind = silk_limit_int(next, 0, N_LEVELS_QGAIN - 1) as i8;
+    }
+    ind
+}
+
 pub fn silk_quant_ltp_gains(
     b_q14: &mut [i16],
     cbk_index: &mut [i8],
@@ -205,4 +261,39 @@ pub fn silk_gains_id(ind: &[i8; MAX_NB_SUBFR], nb_subfr: i32) -> i32 {
         gains_id = (ind[k] as i32) + (gains_id << 8);
     }
     gains_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `silk_gains_levels` and `silk_gains_encode_levels` invert each other on
+    /// everything `silk_gains_quant` produces, conditional or not, across the
+    /// whole gain range (including the double-step region at low levels).
+    #[test]
+    fn gain_levels_round_trip_quantized_indices() {
+        let mut lcg = 0x2468_ace1u32;
+        for case in 0..4000 {
+            let mut gain_q16 = [0i32; MAX_NB_SUBFR];
+            for g in gain_q16.iter_mut() {
+                lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                // Log-uniform over roughly the quantizer's span.
+                *g = silk_log2lin(((lcg >> 8) % 3968) as i32);
+            }
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let prev0 = ((lcg >> 8) % N_LEVELS_QGAIN as u32) as i8;
+            let conditional = case & 1;
+            let mut ind = [0i8; MAX_NB_SUBFR];
+            let mut prev = prev0;
+            silk_gains_quant(&mut ind, &mut gain_q16, &mut prev, conditional, MAX_NB_SUBFR);
+
+            let levels = silk_gains_levels(&ind, prev0, conditional, MAX_NB_SUBFR);
+            assert_eq!(levels[MAX_NB_SUBFR - 1], prev, "case {case}: final level");
+            assert_eq!(
+                silk_gains_encode_levels(&levels, prev0, conditional, MAX_NB_SUBFR),
+                ind,
+                "case {case}: levels {levels:?} from {prev0}"
+            );
+        }
+    }
 }
