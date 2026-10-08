@@ -554,11 +554,11 @@ fn every_silk_frame_size_codes_the_side() {
 /// as before #48); recovered from both channels they stay as far apart as in
 /// the normal decode.
 ///
-/// libopus narrows this image itself (its normal decode measures L·R about
-/// +0.5): it takes the LBRR bits out of SILK's target, and the width control
-/// sees the lower rate. opus-rs doesn't yet, so the recovery is compared with
-/// opus-rs's own normal decode. Hybrid VBR, because SILK-only VBR doesn't
-/// follow the bitrate yet (#43).
+/// Both encoders narrow this image (normal decode L·R +0.57 for opus-rs,
+/// +0.54 for libopus): the LBRR bits come out of SILK's target (#51), and the
+/// width control sees the lower rate. The recovery measures +0.66, libopus's
+/// +0.68. Hybrid VBR, because SILK-only VBR doesn't follow the bitrate yet
+/// (#43).
 #[test]
 fn stereo_fec_recovers_both_channels() {
     let case = Case {
@@ -578,8 +578,9 @@ fn stereo_fec_recovers_both_channels() {
         "", rs.corr, c.corr
     );
     assert!(
-        rs_rec < 0.5 && (rs_rec - rs.corr).abs() < 0.3,
-        "{}: FEC-recovered L·R {rs_rec:+.2}, normal decode {:+.2}: the side's LBRR is missing",
+        rs_rec < 0.8 && (rs_rec - c_rec).abs() < 0.15 && (rs_rec - rs.corr).abs() < 0.3,
+        "{}: FEC-recovered L·R {rs_rec:+.2} (libopus {c_rec:+.2}), normal decode {:+.2}: \
+         the side's LBRR is missing",
         case.name,
         rs.corr
     );

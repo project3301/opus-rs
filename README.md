@@ -118,6 +118,18 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
 
 ### Unreleased
 
+- **Fix: SILK CBR with in-band FEC busted packets into concealed frames
+  (issue #51).** SILK's frame target now leaves room for the packet's LBRR
+  section, as libopus's does. This ports `enc_API.c`'s per-frame target, for
+  mono and stereo: the moving average of LBRR bits (`nBitsUsedLBRR`), the
+  bit reservoir across packets (`nBitsExceeded`) and the balance within a
+  multi-frame packet (`bitsBalance`). The frame cap no longer takes the
+  LBRR bits off a second time, since the rate control already counts them.
+  At 16-48 kb/s, 20 ms and 40% loss, mono busts 0-1 packets in 50 (was up
+  to 8; libopus 0-2) and stereo 0-2 (was up to 15). Stereo carries LBRR in
+  22-31 packets (was 5-20; libopus 29-30). Mono's main frame codes as well
+  as without FEC (worst window 4.6 dB, was 0.3). Hybrid's SILK layer also
+  pays back its overshoot of the target rate, as libopus's does.
 - **Stereo SILK/Hybrid codes the side, as libopus does (issue #48).** L and R
   are resampled separately and converted to mid/side at the internal rate by
   a bit-exact port of libopus's `silk_stereo_LR_to_MS`: predictor estimation
@@ -130,10 +142,8 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
   as libopus does. Two unrelated voices go from +1.9/+2.8 to +6.0/+9.3 dB
   (libopus +5.4/+8.0). Hybrid splits its SILK rate per channel, as libopus's
   `compute_silk_rate_for_hybrid` does. Mono output is unchanged, byte for
-  byte. Known gap: under CBR with in-band FEC, the side's LBRR adds to an
-  LBRR budget that doesn't come out of the frame target as in libopus
-  (#51), so stereo LBRR recovery in that regime is weaker than before;
-  the normal decode is better.
+  byte. Under CBR with in-band FEC the side's LBRR at first crowded LBRR
+  out of many packets; #51 (above) fixes that.
 - **Fix: stereo SILK/Hybrid decoded as L ≈ −0.63·mid, R ≈ 2.63·mid (issue
   #42).** The encoder codes stereo SILK as the mid only, but wrote stereo
   predictor index 0, which dequantizes to `pred_Q13 = (0, −13364)`. The

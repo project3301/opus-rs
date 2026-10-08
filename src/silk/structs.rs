@@ -336,6 +336,17 @@ pub struct SilkEncoderState {
 
     pub stereo: SilkStereoState,
 
+    /// Moving average of the bits spent on each packet's LBRR section, taken
+    /// out of the frame target (libopus `nBitsUsedLBRR`).
+    ///
+    /// This and `n_bits_exceeded` belong to libopus's packet-level
+    /// `silk_encoder`, which spans both channels; opus-rs keeps them in the
+    /// mono or mid channel's state, next to the stereo state.
+    pub n_bits_used_lbrr: i32,
+    /// Bits by which the coded packets have overshot the target rate, which
+    /// the next frames pay back (libopus `nBitsExceeded`, 0..=10000).
+    pub n_bits_exceeded: i32,
+
     pub resampler_delay_buf: [i16; 48],
 }
 
@@ -351,6 +362,8 @@ impl Default for SilkEncoderState {
             pitch_estimation_lpc_order: 0,
             ps_nlsf_cb: None,
             stereo: SilkStereoState::default(),
+            n_bits_used_lbrr: 0,
+            n_bits_exceeded: 0,
             resampler_delay_buf: [0; 48],
         }
     }

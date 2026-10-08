@@ -960,6 +960,9 @@ impl OpusEncoder {
                 self.prev_enc_mode == Some(OpusMode::CeltOnly);
             if silk_restart_after_celt {
                 silk_init_encoder(state_mut(&mut self.silk_enc), 0);
+                // C silk_InitEncoder also clears the packet-level rate state.
+                self.silk_enc.n_bits_used_lbrr = 0;
+                self.silk_enc.n_bits_exceeded = 0;
                 if self.channels == 2 {
                     // C silk_InitEncoder clears the side encoder and the
                     // stereo state too; the next stereo frame starts afresh.
